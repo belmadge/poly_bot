@@ -73,6 +73,46 @@ class PolymarketClient:
 
         raise PolymarketApiError("Unable to fetch current price with current py-clob-client-v2 version.")
 
+    def get_order_book(self, token_id: str) -> dict[str, Any]:
+        for getter_name in ("get_book", "get_order_book"):
+            if hasattr(self.client, getter_name):
+                book = self._call_client(self.client, getter_name, token_id=token_id)
+                return self._to_dict(book)
+        raise PolymarketApiError("Unable to fetch order book with current py-clob-client-v2 version.")
+
+    def get_market_snapshot(self, token_id: str) -> dict[str, Any]:
+        book = self.get_order_book(token_id)
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        if not bids or not asks:
+            raise PolymarketApiError(f"Order book missing bids/asks: {book}")
+
+        best_bid = self._best_price(bids, side="bid")
+        best_ask = self._best_price(asks, side="ask")
+        bid_depth = self._sum_sizes(bids)
+        ask_depth = self._sum_sizes(asks)
+        midpoint = (best_bid + best_ask) / 2.0
+        liquidity_score = min(bid_depth, ask_depth)
+        return {
+            "token_id": token_id,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "midpoint": midpoint,
+            "book_spread": max(0.0, best_ask - best_bid),
+            "bid_depth": bid_depth,
+            "ask_depth": ask_depth,
+            "liquidity_score": liquidity_score,
+            "raw_book": book,
+        }
+
+    def get_candidate_token_ids(self) -> list[str]:
+        token_ids = list(dict.fromkeys([self.settings.token_id, *self.settings.token_ids]))
+        discovered = self._discover_token_ids()
+        for token_id in discovered:
+            if token_id not in token_ids:
+                token_ids.append(token_id)
+        return token_ids[: self.settings.market_scan_limit]
+
     def get_open_orders(self, token_id: str) -> list[dict[str, Any]]:
         candidates = [
             ("get_open_orders", {"token_id": token_id}),
@@ -173,6 +213,27 @@ class PolymarketClient:
             logger.exception("Falha na chamada CLOB", extra={"method": method_name, "params": kwargs})
             raise PolymarketApiError(f"CLOB call failed: {method_name}") from exc
 
+    def _discover_token_ids(self) -> list[str]:
+        candidates = [
+            ("get_markets", {}),
+            ("list_markets", {}),
+            ("get_simplified_markets", {}),
+            ("get_sampling_markets", {}),
+        ]
+        for method_name, kwargs in candidates:
+            if not hasattr(self.client, method_name):
+                continue
+            try:
+                payload = self._call_client(self.client, method_name, **kwargs)
+            except PolymarketApiError:
+                continue
+
+            raw_items = self._extract_list(payload, keys=("markets", "data", "items", "results"))
+            token_ids = self._extract_token_ids_from_markets(raw_items)
+            if token_ids:
+                return token_ids
+        return []
+
     @staticmethod
     def _extract_list(payload: Any, keys: tuple[str, ...]) -> list[Any]:
         if isinstance(payload, list):
@@ -183,6 +244,25 @@ class PolymarketClient:
             if key in normalized and isinstance(normalized[key], list):
                 return normalized[key]
         return []
+
+    @staticmethod
+    def _extract_token_ids_from_markets(markets: list[Any]) -> list[str]:
+        token_ids: list[str] = []
+        for market in markets:
+            parsed = PolymarketClient._to_dict(market)
+            for key in ("token_id", "tokenId", "clob_token_id", "clobTokenId"):
+                value = parsed.get(key)
+                if value:
+                    token_ids.append(str(value))
+            outcomes = parsed.get("outcomes") or parsed.get("tokens") or parsed.get("market_tokens") or []
+            if isinstance(outcomes, list):
+                for outcome in outcomes:
+                    outcome_dict = PolymarketClient._to_dict(outcome)
+                    for key in ("token_id", "tokenId", "clob_token_id", "clobTokenId"):
+                        value = outcome_dict.get(key)
+                        if value:
+                            token_ids.append(str(value))
+        return list(dict.fromkeys(token_ids))
 
     @staticmethod
     def _extract_status(order: dict[str, Any]) -> str:
@@ -268,3 +348,19 @@ class PolymarketClient:
             raise PolymarketApiError("Unable to parse order book levels")
 
         return max(prices) if side == "bid" else min(prices)
+
+    @staticmethod
+    def _sum_sizes(levels: list[Any]) -> float:
+        total = 0.0
+        for level in levels:
+            if isinstance(level, dict):
+                value = level.get("size") or level.get("quantity") or level.get("amount")
+            else:
+                value = (
+                    getattr(level, "size", None)
+                    or getattr(level, "quantity", None)
+                    or getattr(level, "amount", None)
+                )
+            if value is not None:
+                total += float(value)
+        return total
