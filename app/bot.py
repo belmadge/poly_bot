@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from app.config import Settings
@@ -49,8 +50,27 @@ class MarketMakerBot:
         self.net_positions: dict[str, float] = state.net_positions
         self.last_market_prices: dict[str, float] = state.last_market_prices
         self.current_token_id = settings.token_id
+        # Performance metrics
+        self.trades_executed: int = state.trades_executed
+        self.total_pnl_realized: float = state.total_pnl_realized
+        self.last_metrics_log_time: float = state.last_metrics_log_time
+        # Error tracking
+        self.consecutive_api_errors: int = state.consecutive_api_errors
+        self.last_api_error_time: float = state.last_api_error_time
+        self.consecutive_execution_errors: int = 0
+        # Last executed fill timestamp for order synchronization
+        self.last_api_sync_time: float = time.time()
 
     def run_once(self) -> None:
+        # CRITICAL: Synchronize with API - ensure API is source of truth
+        self._sync_orders_with_api()
+        
+        # Check balance thresholds
+        if not self._check_balance_safety():
+            logger.critical("KILL SWITCH: Balance below minimum threshold", extra={"event": "kill_switch_balance"})
+            self._save_state()
+            raise PolymarketApiError("Balance safety check failed - stopping bot")
+        
         context = self._build_quote_context()
         filled_orders = self._check_fills()
         token_balance = self._get_token_balance()
@@ -67,15 +87,31 @@ class MarketMakerBot:
                 },
             )
 
+        # SMART CANCELLATION: Only cancel orders if needed (price moved significantly or orders out of sync)
         self._cancel_orders_for_inactive_markets(context.token_id)
         current_open_orders = self.list_open_orders(token_id=context.token_id)
-        if self._should_refresh_orders(context, current_open_orders):
+        
+        # Check if reposition is needed (REPOSITIONING CONTROL)
+        if self._should_refresh_orders_smart(context, current_open_orders):
+            logger.info(
+                "Cancelando ordens antigas para reposicionamento",
+                extra={
+                    "event": "cancel_for_reposition",
+                    "token_id": context.token_id,
+                    "count": len(current_open_orders),
+                },
+            )
             self.cancel_open_orders(current_open_orders)
             remaining_open_orders = self.list_open_orders(token_id=context.token_id)
         else:
             remaining_open_orders = current_open_orders
+            
         self._place_quotes(context, execution_plan, token_balance, remaining_open_orders)
         self.last_market_prices[context.token_id] = context.current_price
+        
+        # Log performance metrics periodically
+        self._log_performance_metrics()
+        
         self._save_state()
 
     def run_forever(self) -> None:
@@ -88,16 +124,66 @@ class MarketMakerBot:
             },
         )
         while True:
+            # Check kill switch
+            if self._check_kill_switch():
+                logger.critical("KILL SWITCH ACTIVATED. Shutting down bot.", extra={"event": "kill_switch"})
+                break
+                
             try:
                 self.run_once()
+                # Reset error counters on success
+                self.consecutive_api_errors = 0
+                self.consecutive_execution_errors = 0
+                self.last_api_error_time = 0.0
             except KeyboardInterrupt:
                 logger.info("Bot interrompido pelo usuario.", extra={"event": "shutdown"})
                 break
             except PolymarketApiError as exc:
-                logger.exception("Erro de API no loop principal", extra={"event": "api_error", "error": str(exc)})
+                self.consecutive_api_errors += 1
+                self.last_api_error_time = time.time()
+                logger.exception(
+                    "Erro de API no loop principal",
+                    extra={
+                        "event": "api_error",
+                        "error": str(exc),
+                        "consecutive_errors": self.consecutive_api_errors,
+                        "max_allowed": self.settings.max_api_failure_streak,
+                    },
+                )
+                # Check if we've exceeded max API failures
+                if self.consecutive_api_errors >= self.settings.max_api_failure_streak:
+                    logger.critical(
+                        "KILL SWITCH: Max API failures exceeded",
+                        extra={
+                            "event": "kill_switch_api_failures",
+                            "consecutive_errors": self.consecutive_api_errors,
+                        },
+                    )
+                    self._save_state()
+                    break
             except Exception as exc:  # noqa: BLE001
-                logger.exception("Erro inesperado no loop principal", extra={"event": "unexpected", "error": str(exc)})
+                self.consecutive_execution_errors += 1
+                logger.exception(
+                    "Erro inesperado no loop principal",
+                    extra={
+                        "event": "unexpected",
+                        "error": str(exc),
+                        "consecutive_errors": self.consecutive_execution_errors,
+                    },
+                )
+                # Check if we've exceeded max execution errors
+                if self.consecutive_execution_errors >= self.settings.max_consecutive_errors:
+                    logger.critical(
+                        "KILL SWITCH: Max execution errors exceeded",
+                        extra={
+                            "event": "kill_switch_exec_errors",
+                            "consecutive_errors": self.consecutive_execution_errors,
+                        },
+                    )
+                    self._save_state()
+                    break
             finally:
+                self._save_state()
                 time.sleep(self.settings.loop_interval_seconds)
 
     def list_open_orders(self, token_id: str | None = None) -> list[dict[str, Any]]:
@@ -462,7 +548,7 @@ class MarketMakerBot:
     def _get_net_position(self, token_id: str) -> float:
         return float(self.net_positions.get(token_id, 0.0))
 
-    def _register_fill(self, token_id: str, side: str, size: float) -> None:
+    def _register_fill(self, token_id: str, side: str, size: float, is_partial: bool = False) -> None:
         delta = size if side == "buy" else -size
         updated = round(self._get_net_position(token_id) + delta, 4)
         self.net_positions[token_id] = updated
@@ -473,6 +559,7 @@ class MarketMakerBot:
                 "token_id": token_id,
                 "side": side,
                 "size": size,
+                "is_partial": is_partial,
                 "net_position": updated,
             },
         )
@@ -483,6 +570,11 @@ class MarketMakerBot:
                 known_orders=self.known_orders,
                 net_positions=self.net_positions,
                 last_market_prices=self.last_market_prices,
+                trades_executed=self.trades_executed,
+                total_pnl_realized=self.total_pnl_realized,
+                last_metrics_log_time=self.last_metrics_log_time,
+                consecutive_api_errors=self.consecutive_api_errors,
+                last_api_error_time=self.last_api_error_time,
             )
         )
 
@@ -502,20 +594,47 @@ class MarketMakerBot:
             if status in FILLED_STATUSES:
                 token_id = str(snapshot.get("token_id") or self.current_token_id)
                 side = snapshot.get("side") or self._extract_side(details)
-                size = self._extract_size(details) or snapshot.get("size") or 0.0
-                self._register_fill(token_id=token_id, side=side, size=float(size))
+                filled_size = self._extract_size(details) or snapshot.get("size") or 0.0
+                original_size = snapshot.get("size") or filled_size
+                
+                # EXECUTION CONTROL: Detect partial fills
+                is_partial = float(filled_size) < float(original_size)
+                
+                self._register_fill(
+                    token_id=token_id,
+                    side=side,
+                    size=float(filled_size),
+                    is_partial=is_partial,
+                )
+                
+                # EXECUTION CONTROL: Ensure hedge position
+                opposite_side = "sell" if side == "buy" else "buy"
+                remaining_size = float(filled_size)
+                
                 fill_info = {
                     "order_id": order_id,
                     "token_id": token_id,
                     "side": side,
                     "price": self._extract_price(details) or snapshot.get("price"),
-                    "size": size,
+                    "filled_size": filled_size,
+                    "original_size": original_size,
+                    "is_partial": is_partial,
                     "status": status,
                     "details": details,
                     "net_position": self._get_net_position(token_id),
                 }
                 filled_orders.append(fill_info)
-                logger.info("Ordem executada", extra={"event": "filled", **fill_info})
+                
+                self.trades_executed += 1
+                logger.info(
+                    "Ordem executada",
+                    extra={
+                        "event": "filled",
+                        "partial": is_partial,
+                        "remaining_size": remaining_size if is_partial else 0,
+                        **fill_info,
+                    },
+                )
             elif status in CLOSED_STATUSES:
                 logger.info(
                     "Ordem encerrada",
@@ -770,3 +889,247 @@ class MarketMakerBot:
             "status": self._extract_status(order),
             "raw": order,
         }
+
+    # ========== KILL SWITCH IMPLEMENTATION ==========
+    def _check_kill_switch(self) -> bool:
+        """Check if kill switch should be activated."""
+        # Check manual kill switch flag file
+        flag_file_path = Path(self.settings.kill_switch_flag_file)
+        if flag_file_path.exists():
+            logger.critical(
+                "KILL SWITCH: Flag file detected",
+                extra={"event": "kill_switch_flag_file", "path": str(flag_file_path)},
+            )
+            return True
+        return False
+
+    def _check_balance_safety(self) -> bool:
+        """Check if balance is above minimum threshold."""
+        collateral = self._with_retry(self.client.get_collateral_balance)
+        if collateral is None:
+            logger.warning("Unable to check balance safety", extra={"event": "balance_check_failed"})
+            return True
+        
+        is_safe = collateral >= self.settings.min_balance_threshold
+        if not is_safe:
+            logger.critical(
+                "Balance below minimum threshold",
+                extra={
+                    "event": "balance_safety_failed",
+                    "balance": collateral,
+                    "minimum": self.settings.min_balance_threshold,
+                },
+            )
+        return is_safe
+
+    # ========== API SYNCHRONIZATION (CRÍTICO) ==========
+    def _sync_orders_with_api(self) -> None:
+        """
+        CRITICAL: Synchronize known_orders with API.
+        Remove local orders that no longer exist on API.
+        This ensures API is the source of truth.
+        """
+        try:
+            api_open_orders = self._with_retry(
+                lambda: self.client.get_open_orders(self.current_token_id)
+            )
+            api_order_ids = {
+                self.client.extract_order_id(order)
+                for order in api_open_orders
+                if self.client.extract_order_id(order)
+            }
+            
+            # Remove orders from local state that don't exist on API
+            stale_order_ids = set(self.known_orders.keys()) - api_order_ids
+            if stale_order_ids:
+                logger.info(
+                    "Removendo ordens stale do estado local (nao encontradas na API)",
+                    extra={
+                        "event": "api_sync_stale_removal",
+                        "count": len(stale_order_ids),
+                        "order_ids": list(stale_order_ids),
+                    },
+                )
+                for order_id in stale_order_ids:
+                    del self.known_orders[order_id]
+            
+            # Update local known_orders with API data
+            for order in api_open_orders:
+                order_id = self.client.extract_order_id(order)
+                if order_id:
+                    self.known_orders[order_id] = self._build_order_snapshot(order)
+            
+            self.last_api_sync_time = time.time()
+            logger.info(
+                "API sync completo",
+                extra={
+                    "event": "api_sync_complete",
+                    "api_orders": len(api_order_ids),
+                    "local_orders": len(self.known_orders),
+                    "stale_removed": len(stale_order_ids),
+                },
+            )
+        except PolymarketApiError as exc:
+            logger.exception(
+                "Falha na sincronizacao com API",
+                extra={"event": "api_sync_failed", "error": str(exc)},
+            )
+            raise
+
+    # ========== SMART CANCELLATION LOGIC ==========
+    def _smart_cancel_open_orders(
+        self,
+        open_orders: list[dict[str, Any]],
+        context: QuoteContext,
+    ) -> None:
+        """
+        SMART CANCELLATION: Cancel orders intelligently:
+        - Cancel orders that are out of current price range
+        - Or cancel ALL orders if price moved significantly
+        - Avoid unnecessary churn
+        """
+        if not open_orders:
+            return
+        
+        orders_out_of_range = []
+        for order in open_orders:
+            order_side = self._extract_side(order)
+            order_price = self._extract_price(order)
+            
+            if order_price is None:
+                continue
+            
+            # Check if order is outside current quote range
+            buy_price = context.quotes["buy"].price
+            sell_price = context.quotes["sell"].price
+            
+            if order_side == "buy" and order_price < buy_price - self.settings.price_tolerance:
+                orders_out_of_range.append(order)
+                logger.info(
+                    "BUY order fora do range (preco muito baixo)",
+                    extra={
+                        "event": "order_out_of_range_buy",
+                        "order_price": order_price,
+                        "new_buy_price": buy_price,
+                    },
+                )
+            elif order_side == "sell" and order_price > sell_price + self.settings.price_tolerance:
+                orders_out_of_range.append(order)
+                logger.info(
+                    "SELL order fora do range (preco muito alto)",
+                    extra={
+                        "event": "order_out_of_range_sell",
+                        "order_price": order_price,
+                        "new_sell_price": sell_price,
+                    },
+                )
+        
+        if orders_out_of_range:
+            self.cancel_open_orders(orders_out_of_range)
+
+    # ========== REPOSITIONING CONTROL ==========
+    def _should_refresh_orders_smart(
+        self,
+        context: QuoteContext,
+        open_orders: list[dict[str, Any]],
+    ) -> bool:
+        """
+        REPOSITIONING CONTROL: Reduce order churn
+        - Only recreate orders if price changes above threshold
+        - Avoid unnecessary cancel/recreate cycles
+        """
+        if not open_orders:
+            logger.info(
+                "Sem ordens abertas; refresh desnecessario.",
+                extra={"event": "refresh_skip_empty", "token_id": context.token_id},
+            )
+            return False
+
+        # Check if price moved significantly (above reposition threshold)
+        if context.price_change_ratio >= self.settings.reposition_price_threshold:
+            logger.info(
+                "Ordens marcadas para refresh por movimento significativo de preco",
+                extra={
+                    "event": "refresh_price_threshold",
+                    "token_id": context.token_id,
+                    "price_change_ratio": round(context.price_change_ratio, 6),
+                    "threshold": self.settings.reposition_price_threshold,
+                },
+            )
+            return True
+
+        # Check if any quote mismatches current prices
+        for side, quote in context.quotes.items():
+            if not self._has_matching_open_order(open_orders, quote):
+                logger.info(
+                    "Ordens marcadas para refresh por desalinhamento com novo preco",
+                    extra={
+                        "event": "refresh_price_mismatch",
+                        "token_id": context.token_id,
+                        "side": side,
+                        "quote_price": quote.price,
+                    },
+                )
+                return True
+
+        logger.info(
+            "Ordens atuais ainda validas; mantendo no book",
+            extra={
+                "event": "refresh_keep",
+                "token_id": context.token_id,
+                "price_change_ratio": round(context.price_change_ratio, 6),
+            },
+        )
+        return False
+
+    # ========== PERFORMANCE METRICS LOGGING ==========
+    def _log_performance_metrics(self) -> None:
+        """
+        PERFORMANCE LOGGING: Log key metrics periodically
+        - Estimated PnL
+        - Trades executed
+        - Order execution rate
+        - Time-weighted metrics
+        """
+        current_time = time.time()
+        time_since_last_log = current_time - self.last_metrics_log_time
+        
+        if time_since_last_log < self.settings.metrics_log_interval_seconds:
+            return
+        
+        self.last_metrics_log_time = current_time
+        
+        # Calculate estimated PnL (based on net positions and last known prices)
+        estimated_pnl = 0.0
+        for token_id, net_position in self.net_positions.items():
+            if net_position != 0:
+                last_price = self.last_market_prices.get(token_id, 0.0)
+                if last_price > 0:
+                    # Simple unrealized PnL estimate
+                    estimated_pnl += net_position * last_price
+        
+        # Calculate execution rate
+        execution_rate = (
+            self.trades_executed / (time_since_last_log / 3600)
+            if time_since_last_log > 0
+            else 0
+        )
+        
+        # Log comprehensive metrics
+        logger.info(
+            "Performance Metrics",
+            extra={
+                "event": "performance_metrics",
+                "trades_executed": self.trades_executed,
+                "total_pnl_realized": round(self.total_pnl_realized, 4),
+                "estimated_unrealized_pnl": round(estimated_pnl, 4),
+                "execution_rate_per_hour": round(execution_rate, 2),
+                "open_orders_count": len(self.known_orders),
+                "tracked_positions_count": len(self.net_positions),
+                "consecutive_api_errors": self.consecutive_api_errors,
+                "consecutive_execution_errors": self.consecutive_execution_errors,
+                "time_since_last_api_error": round(current_time - self.last_api_error_time, 1)
+                if self.last_api_error_time > 0
+                else 0,
+            },
+        )

@@ -40,6 +40,15 @@ class Settings:
     log_level: str
     log_format: str
     state_file: str
+    # KILL SWITCH: Safety mechanisms
+    max_consecutive_errors: int
+    min_balance_threshold: float
+    max_api_failure_streak: int
+    kill_switch_flag_file: str
+    # REPOSITIONING: Order churn reduction
+    reposition_price_threshold: float
+    # PERFORMANCE: Metrics tracking
+    metrics_log_interval_seconds: int
     api_key: str | None = None
     api_secret: str | None = None
     api_passphrase: str | None = None
@@ -106,6 +115,15 @@ def load_settings() -> Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             log_format=os.getenv("LOG_FORMAT", "text"),
             state_file=os.getenv("STATE_FILE", "bot_state.json"),
+            # KILL SWITCH
+            max_consecutive_errors=int(os.getenv("MAX_CONSECUTIVE_ERRORS", "5")),
+            min_balance_threshold=float(os.getenv("MIN_BALANCE_THRESHOLD", "10.0")),
+            max_api_failure_streak=int(os.getenv("MAX_API_FAILURE_STREAK", "3")),
+            kill_switch_flag_file=os.getenv("KILL_SWITCH_FLAG_FILE", ".kill_switch"),
+            # REPOSITIONING
+            reposition_price_threshold=float(os.getenv("REPOSITION_PRICE_THRESHOLD", "0.001")),
+            # PERFORMANCE
+            metrics_log_interval_seconds=int(os.getenv("METRICS_LOG_INTERVAL_SECONDS", "3600")),
             api_key=os.getenv("CLOB_API_KEY"),
             api_secret=os.getenv("CLOB_SECRET"),
             api_passphrase=os.getenv("CLOB_PASS_PHRASE"),
