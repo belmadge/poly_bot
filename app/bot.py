@@ -7,6 +7,7 @@ from typing import Any
 
 from app.config import Settings
 from app.polymarket import CLOSED_STATUSES, FILLED_STATUSES, PolymarketApiError, PolymarketClient
+from app.state import BotState, BotStateStore
 
 
 logger = logging.getLogger(__name__)
@@ -19,89 +20,63 @@ class Quote:
     size: float
 
 
+@dataclass(frozen=True)
+class QuoteContext:
+    token_id: str
+    current_price: float
+    previous_price: float | None
+    price_change_ratio: float
+    spread: float
+    book_spread: float
+    liquidity_score: float
+    quotes: dict[str, Quote]
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    buy: Quote
+    sell: Quote
+    net_position: float
+
+
 class MarketMakerBot:
     def __init__(self, settings: Settings, client: PolymarketClient) -> None:
         self.settings = settings
         self.client = client
-        self.known_orders: dict[str, dict[str, Any]] = {}
+        self.state_store = BotStateStore(settings.state_file)
+        state = self.state_store.load()
+        self.known_orders: dict[str, dict[str, Any]] = state.known_orders
+        self.net_positions: dict[str, float] = state.net_positions
+        self.last_market_prices: dict[str, float] = state.last_market_prices
         self.current_token_id = settings.token_id
 
     def run_once(self) -> None:
-        market = self._select_market()
-        token_id = market["token_id"]
-        self.current_token_id = token_id
-        spread = self._determine_spread(market)
-        current_price = market["midpoint"]
-        quotes = self._build_quotes(current_price, spread)
-
-        logger.info(
-            "Calculated quotes",
-            extra={
-                "event": "quotes",
-                "token_id": token_id,
-                "price": current_price,
-                "buy_price": quotes["buy"].price,
-                "sell_price": quotes["sell"].price,
-                "size": self.settings.size,
-                "spread": spread,
-                "liquidity_score": market["liquidity_score"],
-            },
-        )
-
+        context = self._build_quote_context()
         filled_orders = self._check_fills()
-
         token_balance = self._get_token_balance()
+        execution_plan = self._build_execution_plan(context)
+
         if filled_orders:
             logger.info(
                 "Posicao apos execucao",
-                extra={"event": "position_after_fill", "token_id": token_id, "token_balance": token_balance, "filled_count": len(filled_orders)},
+                extra={
+                    "event": "position_after_fill",
+                    "token_id": context.token_id,
+                    "token_balance": token_balance,
+                    "filled_count": len(filled_orders),
+                },
             )
 
-        open_orders = self.list_all_open_orders()
-        if open_orders:
-            self.cancel_open_orders(open_orders)
-
-        remaining_open_orders = self.list_open_orders(token_id=token_id)
-        reusable_orders = self._find_duplicate_target_orders(remaining_open_orders, quotes)
-
-        if not self._position_allows_side("buy", token_balance):
-            logger.info("BUY bloqueado por controle de posicao.", extra={"event": "skip_buy_position"})
-        elif not self._has_buy_balance(quotes["buy"]):
-            logger.warning("Saldo insuficiente para BUY, ordem pulada.", extra={"event": "skip_buy_no_balance"})
-        elif reusable_orders.get("buy"):
-            logger.info("BUY já existe no preço alvo; evitando duplicação.", extra={"event": "dedupe_buy"})
+        self._cancel_orders_for_inactive_markets(context.token_id)
+        current_open_orders = self.list_open_orders(token_id=context.token_id)
+        if self._should_refresh_orders(context, current_open_orders):
+            self.cancel_open_orders(current_open_orders)
+            remaining_open_orders = self.list_open_orders(token_id=context.token_id)
         else:
-            buy_resp = self._with_retry(
-                lambda: self.client.place_limit_order(
-                    token_id=token_id,
-                    side="buy",
-                    price=quotes["buy"].price,
-                    size=quotes["buy"].size,
-                )
-            )
-            logger.info("Ordem BUY enviada", extra={"event": "place_buy", "response": buy_resp})
-            self._track_order_id(buy_resp)
-
-        if not self._position_allows_side("sell", token_balance):
-            logger.info("SELL bloqueado por controle de posicao.", extra={"event": "skip_sell_position"})
-        elif not self._has_sell_balance(quotes["sell"]):
-            logger.warning(
-                "Saldo/posição insuficiente para SELL, ordem pulada.",
-                extra={"event": "skip_sell_no_balance"},
-            )
-        elif reusable_orders.get("sell"):
-            logger.info("SELL já existe no preço alvo; evitando duplicação.", extra={"event": "dedupe_sell"})
-        else:
-            sell_resp = self._with_retry(
-                lambda: self.client.place_limit_order(
-                    token_id=token_id,
-                    side="sell",
-                    price=quotes["sell"].price,
-                    size=quotes["sell"].size,
-                )
-            )
-            logger.info("Ordem SELL enviada", extra={"event": "place_sell", "response": sell_resp})
-            self._track_order_id(sell_resp)
+            remaining_open_orders = current_open_orders
+        self._place_quotes(context, execution_plan, token_balance, remaining_open_orders)
+        self.last_market_prices[context.token_id] = context.current_price
+        self._save_state()
 
     def run_forever(self) -> None:
         logger.info(
@@ -116,7 +91,7 @@ class MarketMakerBot:
             try:
                 self.run_once()
             except KeyboardInterrupt:
-                logger.info("Bot interrompido pelo usuário.", extra={"event": "shutdown"})
+                logger.info("Bot interrompido pelo usuario.", extra={"event": "shutdown"})
                 break
             except PolymarketApiError as exc:
                 logger.exception("Erro de API no loop principal", extra={"event": "api_error", "error": str(exc)})
@@ -128,11 +103,15 @@ class MarketMakerBot:
     def list_open_orders(self, token_id: str | None = None) -> list[dict[str, Any]]:
         target_token_id = token_id or self.current_token_id
         open_orders = self._with_retry(lambda: self.client.get_open_orders(target_token_id))
-        order_ids = self._extract_unique_order_ids(open_orders)
         self._remember_orders(open_orders)
         logger.info(
-            "Open orders loaded",
-            extra={"event": "open_orders", "token_id": target_token_id, "count": len(open_orders), "order_ids": order_ids},
+            "Ordens abertas listadas",
+            extra={
+                "event": "open_orders",
+                "token_id": target_token_id,
+                "count": len(open_orders),
+                "order_ids": self._extract_unique_order_ids(open_orders),
+            },
         )
         return open_orders
 
@@ -141,6 +120,17 @@ class MarketMakerBot:
         for token_id in self._relevant_token_ids():
             all_orders.extend(self.list_open_orders(token_id=token_id))
         return all_orders
+
+    def cancel_all_open_orders(self) -> dict[str, Any] | None:
+        return self.cancel_open_orders(self.list_all_open_orders())
+
+    def _cancel_orders_for_inactive_markets(self, active_token_id: str) -> None:
+        for token_id in self._relevant_token_ids():
+            if token_id == active_token_id:
+                continue
+            open_orders = self.list_open_orders(token_id=token_id)
+            if open_orders:
+                self.cancel_open_orders(open_orders)
 
     def cancel_open_orders(self, open_orders: list[dict[str, Any]]) -> dict[str, Any] | None:
         order_ids = self._extract_unique_order_ids(open_orders)
@@ -151,7 +141,12 @@ class MarketMakerBot:
         cancel_resp = self._with_retry(lambda: self.client.cancel_orders(order_ids))
         for order_id in order_ids:
             self.known_orders.pop(order_id, None)
-        logger.info("Canceled open orders", extra={"event": "cancel", "response": cancel_resp, "count": len(order_ids)})
+
+        logger.info(
+            "Ordens canceladas",
+            extra={"event": "cancel", "count": len(order_ids), "order_ids": order_ids},
+        )
+        self._save_state()
         return cancel_resp
 
     def _with_retry(self, operation: Any) -> Any:
@@ -164,7 +159,7 @@ class MarketMakerBot:
                 if attempt > self.settings.max_retries:
                     raise
                 logger.warning(
-                    "Retrying operation after API failure",
+                    "Tentando novamente apos falha de API",
                     extra={
                         "event": "retry",
                         "attempt": attempt,
@@ -172,6 +167,145 @@ class MarketMakerBot:
                     },
                 )
                 time.sleep(self.settings.retry_delay_seconds)
+
+    def _build_quote_context(self) -> QuoteContext:
+        market = self._select_market()
+        self.current_token_id = market["token_id"]
+        previous_price = self.last_market_prices.get(market["token_id"])
+        price_change_ratio = self._calculate_price_change_ratio(previous_price, market["midpoint"])
+        spread = self._determine_spread(market)
+        quotes = self._build_quotes(market["midpoint"], spread)
+
+        logger.info(
+            "Quotes calculadas",
+            extra={
+                "event": "quotes",
+                "token_id": market["token_id"],
+                "price": market["midpoint"],
+                "previous_price": previous_price,
+                "price_change_ratio": round(price_change_ratio, 6),
+                "buy_price": quotes["buy"].price,
+                "sell_price": quotes["sell"].price,
+                "size": self.settings.size,
+                "spread": spread,
+                "book_spread": market["book_spread"],
+                "liquidity_score": market["liquidity_score"],
+            },
+        )
+        return QuoteContext(
+            token_id=market["token_id"],
+            current_price=market["midpoint"],
+            previous_price=previous_price,
+            price_change_ratio=price_change_ratio,
+            spread=spread,
+            book_spread=market["book_spread"],
+            liquidity_score=market["liquidity_score"],
+            quotes=quotes,
+        )
+
+    def _place_quotes(
+        self,
+        context: QuoteContext,
+        execution_plan: ExecutionPlan,
+        token_balance: float | None,
+        open_orders: list[dict[str, Any]],
+    ) -> None:
+        self._place_quote_if_allowed(context.token_id, execution_plan.buy, token_balance, open_orders)
+        self._place_quote_if_allowed(context.token_id, execution_plan.sell, token_balance, open_orders)
+
+    def _place_quote_if_allowed(
+        self,
+        token_id: str,
+        quote: Quote,
+        token_balance: float | None,
+        open_orders: list[dict[str, Any]],
+    ) -> None:
+        if self._has_duplicate_open_order(open_orders, quote):
+            logger.info(
+                "Ordem duplicada detectada no preco alvo; criacao ignorada.",
+                extra={
+                    "event": "dedupe",
+                    "token_id": token_id,
+                    "side": quote.side,
+                    "price": quote.price,
+                    "size": quote.size,
+                },
+            )
+            return
+
+        if not self._position_allows_side(quote.side, token_balance):
+            logger.info(
+                "Ordem bloqueada por controle de posicao.",
+                extra={"event": "skip_position", "token_id": token_id, "side": quote.side, "price": quote.price},
+            )
+            return
+
+        if not self._risk_allows_order(token_id, quote, token_balance):
+            return
+
+        if quote.side == "buy" and not self._has_buy_balance(quote):
+            logger.warning(
+                "Saldo insuficiente para BUY, ordem pulada.",
+                extra={"event": "skip_buy_no_balance", "token_id": token_id, "price": quote.price, "size": quote.size},
+            )
+            return
+
+        if quote.side == "sell" and not self._has_sell_balance(quote):
+            logger.warning(
+                "Saldo/posicao insuficiente para SELL, ordem pulada.",
+                extra={"event": "skip_sell_no_balance", "token_id": token_id, "price": quote.price, "size": quote.size},
+            )
+            return
+
+        response = self._with_retry(
+            lambda: self.client.place_limit_order(
+                token_id=token_id,
+                side=quote.side,
+                price=quote.price,
+                size=quote.size,
+            )
+        )
+        self._track_order_id(response)
+        logger.info(
+            "Ordem criada",
+            extra={
+                "event": "place_order",
+                "token_id": token_id,
+                "side": quote.side,
+                "price": quote.price,
+                "size": quote.size,
+                "order_id": self.client.extract_order_id(response),
+            },
+        )
+
+    def _build_execution_plan(self, context: QuoteContext) -> ExecutionPlan:
+        net_position = self._get_net_position(context.token_id)
+        buy_size = context.quotes["buy"].size
+        sell_size = context.quotes["sell"].size
+
+        if net_position > 0:
+            sell_size = max(sell_size, abs(net_position))
+        elif net_position < 0:
+            buy_size = max(buy_size, abs(net_position))
+
+        plan = ExecutionPlan(
+            buy=Quote(side="buy", price=context.quotes["buy"].price, size=round(buy_size, 4)),
+            sell=Quote(side="sell", price=context.quotes["sell"].price, size=round(sell_size, 4)),
+            net_position=net_position,
+        )
+        logger.info(
+            "Plano de execucao calculado",
+            extra={
+                "event": "execution_plan",
+                "token_id": context.token_id,
+                "buy_price": plan.buy.price,
+                "buy_size": plan.buy.size,
+                "sell_price": plan.sell.price,
+                "sell_size": plan.sell.size,
+                "net_position": net_position,
+            },
+        )
+        return plan
 
     def _select_market(self) -> dict[str, Any]:
         if not self.settings.auto_select_market:
@@ -216,16 +350,24 @@ class MarketMakerBot:
         low = self.settings.liquidity_target_low
         high = max(self.settings.liquidity_target_high, low + 1e-9)
         liquidity = market["liquidity_score"]
+        previous_price = self.last_market_prices.get(market["token_id"])
+        price_change_ratio = self._calculate_price_change_ratio(previous_price, market["midpoint"])
         normalized = min(1.0, max(0.0, (liquidity - low) / (high - low)))
         adaptive_spread = max_spread - ((max_spread - min_spread) * normalized)
+        volatility_multiplier = self._volatility_spread_multiplier(price_change_ratio)
+        adaptive_spread = adaptive_spread * volatility_multiplier
+        adaptive_spread = min(max_spread, max(min_spread, adaptive_spread))
         final_spread = max(market["book_spread"], adaptive_spread)
         logger.info(
             "Spread dinamico calculado",
             extra={
                 "event": "dynamic_spread",
                 "token_id": market["token_id"],
+                "previous_price": previous_price,
+                "price_change_ratio": round(price_change_ratio, 6),
                 "liquidity_score": liquidity,
                 "book_spread": market["book_spread"],
+                "volatility_multiplier": volatility_multiplier,
                 "adaptive_spread": adaptive_spread,
                 "final_spread": final_spread,
             },
@@ -241,20 +383,60 @@ class MarketMakerBot:
             "sell": Quote(side="sell", price=sell_price, size=self.settings.size),
         }
 
-    def _find_duplicate_target_orders(
-        self, open_orders: list[dict[str, Any]], quotes: dict[str, Quote]
-    ) -> dict[str, dict[str, Any]]:
-        reusable: dict[str, dict[str, Any]] = {}
+    def _should_refresh_orders(self, context: QuoteContext, open_orders: list[dict[str, Any]]) -> bool:
+        if not open_orders:
+            logger.info("Sem ordens abertas; refresh desnecessario.", extra={"event": "refresh_skip_empty", "token_id": context.token_id})
+            return False
 
+        if context.price_change_ratio >= self.settings.price_refresh_threshold:
+            logger.info(
+                "Ordens antigas marcadas para refresh por movimento de preco.",
+                extra={
+                    "event": "refresh_price_move",
+                    "token_id": context.token_id,
+                    "price_change_ratio": round(context.price_change_ratio, 6),
+                    "refresh_threshold": self.settings.price_refresh_threshold,
+                },
+            )
+            return True
+
+        for side, quote in context.quotes.items():
+            if not self._has_matching_open_order(open_orders, quote):
+                logger.info(
+                    "Ordens antigas marcadas para refresh por desalinhamento com novo preco.",
+                    extra={"event": "refresh_requote", "token_id": context.token_id, "side": side, "price": quote.price},
+                )
+                return True
+
+        logger.info(
+            "Ordens atuais ainda validas; mantendo no book.",
+            extra={"event": "refresh_keep", "token_id": context.token_id, "price_change_ratio": round(context.price_change_ratio, 6)},
+        )
+        return False
+
+    @staticmethod
+    def _calculate_price_change_ratio(previous_price: float | None, current_price: float) -> float:
+        if previous_price in {None, 0}:
+            return 0.0
+        return abs(current_price - previous_price) / abs(previous_price)
+
+    def _volatility_spread_multiplier(self, price_change_ratio: float) -> float:
+        if price_change_ratio >= self.settings.high_volatility_threshold:
+            return self.settings.high_volatility_spread_multiplier
+        if price_change_ratio <= self.settings.low_volatility_threshold:
+            return self.settings.low_volatility_spread_multiplier
+        return 1.0
+
+    def _has_duplicate_open_order(self, open_orders: list[dict[str, Any]], quote: Quote) -> bool:
         for order in open_orders:
-            side = self._extract_side(order)
-            if side not in quotes:
+            if self._extract_side(order) != quote.side:
                 continue
+            if self._matches_quote(order, quote):
+                return True
+        return False
 
-            if self._matches_quote(order, quotes[side]) and side not in reusable:
-                reusable[side] = order
-
-        return reusable
+    def _has_matching_open_order(self, open_orders: list[dict[str, Any]], quote: Quote) -> bool:
+        return self._has_duplicate_open_order(open_orders, quote)
 
     def _extract_unique_order_ids(self, open_orders: list[dict[str, Any]]) -> list[str]:
         order_ids: list[str] = []
@@ -274,7 +456,35 @@ class MarketMakerBot:
             token_id = snapshot.get("token_id")
             if token_id:
                 token_ids.append(str(token_id))
+        token_ids.extend(self.net_positions.keys())
         return list(dict.fromkeys(token_ids))
+
+    def _get_net_position(self, token_id: str) -> float:
+        return float(self.net_positions.get(token_id, 0.0))
+
+    def _register_fill(self, token_id: str, side: str, size: float) -> None:
+        delta = size if side == "buy" else -size
+        updated = round(self._get_net_position(token_id) + delta, 4)
+        self.net_positions[token_id] = updated
+        logger.info(
+            "Posicao local atualizada por fill",
+            extra={
+                "event": "position_update",
+                "token_id": token_id,
+                "side": side,
+                "size": size,
+                "net_position": updated,
+            },
+        )
+
+    def _save_state(self) -> None:
+        self.state_store.save(
+            BotState(
+                known_orders=self.known_orders,
+                net_positions=self.net_positions,
+                last_market_prices=self.last_market_prices,
+            )
+        )
 
     def _check_fills(self) -> list[dict[str, Any]]:
         if not self.known_orders:
@@ -290,13 +500,19 @@ class MarketMakerBot:
 
             status = self._extract_status(details)
             if status in FILLED_STATUSES:
+                token_id = str(snapshot.get("token_id") or self.current_token_id)
+                side = snapshot.get("side") or self._extract_side(details)
+                size = self._extract_size(details) or snapshot.get("size") or 0.0
+                self._register_fill(token_id=token_id, side=side, size=float(size))
                 fill_info = {
                     "order_id": order_id,
-                    "side": snapshot.get("side") or self._extract_side(details),
+                    "token_id": token_id,
+                    "side": side,
                     "price": self._extract_price(details) or snapshot.get("price"),
-                    "size": self._extract_size(details) or snapshot.get("size"),
+                    "size": size,
                     "status": status,
                     "details": details,
+                    "net_position": self._get_net_position(token_id),
                 }
                 filled_orders.append(fill_info)
                 logger.info("Ordem executada", extra={"event": "filled", **fill_info})
@@ -309,12 +525,13 @@ class MarketMakerBot:
                 still_open[order_id] = {**snapshot, **details}
 
         self.known_orders = still_open
+        self._save_state()
         return filled_orders
 
     def _has_buy_balance(self, quote: Quote) -> bool:
         collateral = self._with_retry(self.client.get_collateral_balance)
         if collateral is None:
-            logger.warning("Não foi possível validar collateral; prosseguindo com BUY.", extra={"event": "buy_balance_unknown"})
+            logger.warning("Nao foi possivel validar collateral; prosseguindo com BUY.", extra={"event": "buy_balance_unknown"})
             return True
 
         required = (quote.price * quote.size) + self.settings.min_collateral_buffer
@@ -327,7 +544,7 @@ class MarketMakerBot:
     def _has_sell_balance(self, quote: Quote) -> bool:
         token_balance = self._with_retry(lambda: self.client.get_token_balance(self.current_token_id))
         if token_balance is None:
-            logger.warning("Não foi possível validar posição do token; prosseguindo com SELL.", extra={"event": "sell_balance_unknown"})
+            logger.warning("Nao foi possivel validar posicao do token; prosseguindo com SELL.", extra={"event": "sell_balance_unknown"})
             return True
 
         logger.info(
@@ -340,6 +557,20 @@ class MarketMakerBot:
         return self._with_retry(lambda: self.client.get_token_balance(self.current_token_id))
 
     def _position_allows_side(self, side: str, token_balance: float | None) -> bool:
+        local_net_position = self._get_net_position(self.current_token_id)
+        if side == "buy" and local_net_position > 0:
+            logger.info(
+                "BUY bloqueado para evitar acumulacao unilateral.",
+                extra={"event": "skip_unilateral_buy", "token_id": self.current_token_id, "net_position": local_net_position},
+            )
+            return False
+        if side == "sell" and local_net_position < 0:
+            logger.info(
+                "SELL bloqueado para evitar acumulacao unilateral.",
+                extra={"event": "skip_unilateral_sell", "token_id": self.current_token_id, "net_position": local_net_position},
+            )
+            return False
+
         if token_balance is None:
             logger.warning(
                 "Nao foi possivel validar posicao; prosseguindo com ambos os lados.",
@@ -355,6 +586,7 @@ class MarketMakerBot:
                 "event": "position_check",
                 "side": side,
                 "token_balance": token_balance,
+                "local_net_position": local_net_position,
                 "target_position": self.settings.target_position_size,
                 "lower_bound": lower_bound,
                 "upper_bound": upper_bound,
@@ -367,10 +599,113 @@ class MarketMakerBot:
             return token_balance > lower_bound
         return True
 
+    def _risk_allows_order(self, token_id: str, quote: Quote, token_balance: float | None) -> bool:
+        if not self._within_max_exposure(token_id, quote):
+            return False
+        if quote.side == "buy":
+            return self._has_buy_capacity(quote)
+        if quote.side == "sell":
+            return self._has_sell_capacity(quote, token_balance)
+        return True
+
+    def _within_max_exposure(self, token_id: str, quote: Quote) -> bool:
+        current_exposure = self._get_net_position(token_id)
+        projected_exposure = current_exposure + quote.size if quote.side == "buy" else current_exposure - quote.size
+        allowed = abs(projected_exposure) <= self.settings.max_position_size
+        logger.info(
+            "Risk check exposure",
+            extra={
+                "event": "risk_exposure",
+                "token_id": token_id,
+                "side": quote.side,
+                "size": quote.size,
+                "net_position": current_exposure,
+                "projected_exposure": round(projected_exposure, 4),
+                "max_position_size": self.settings.max_position_size,
+            },
+        )
+        if not allowed:
+            logger.warning(
+                "Ordem bloqueada por limite maximo de exposicao.",
+                extra={
+                    "event": "skip_max_exposure",
+                    "token_id": token_id,
+                    "side": quote.side,
+                    "size": quote.size,
+                    "net_position": current_exposure,
+                    "projected_exposure": round(projected_exposure, 4),
+                    "max_position_size": self.settings.max_position_size,
+                },
+            )
+        return allowed
+
+    def _has_buy_capacity(self, quote: Quote) -> bool:
+        collateral = self._with_retry(self.client.get_collateral_balance)
+        if collateral is None:
+            logger.warning(
+                "Nao foi possivel validar collateral para risco; BUY bloqueado.",
+                extra={"event": "risk_buy_balance_unknown"},
+            )
+            return False
+
+        max_usable_collateral = collateral * self.settings.max_balance_usage_pct
+        required = (quote.price * quote.size) + self.settings.min_collateral_buffer
+        allowed = max_usable_collateral >= required
+        logger.info(
+            "Risk check BUY balance",
+            extra={
+                "event": "risk_buy_balance",
+                "collateral": collateral,
+                "max_usable_collateral": round(max_usable_collateral, 4),
+                "required": round(required, 4),
+            },
+        )
+        if not allowed:
+            logger.warning(
+                "BUY bloqueado para preservar reserva de saldo.",
+                extra={
+                    "event": "skip_buy_risk_balance",
+                    "collateral": collateral,
+                    "max_usable_collateral": round(max_usable_collateral, 4),
+                    "required": round(required, 4),
+                },
+            )
+        return allowed
+
+    def _has_sell_capacity(self, quote: Quote, token_balance: float | None) -> bool:
+        if token_balance is None:
+            logger.warning(
+                "Nao foi possivel validar saldo do token para risco; SELL bloqueado.",
+                extra={"event": "risk_sell_balance_unknown"},
+            )
+            return False
+
+        max_usable_tokens = token_balance * self.settings.max_balance_usage_pct
+        allowed = max_usable_tokens >= quote.size
+        logger.info(
+            "Risk check SELL balance",
+            extra={
+                "event": "risk_sell_balance",
+                "token_balance": token_balance,
+                "max_usable_tokens": round(max_usable_tokens, 4),
+                "required": quote.size,
+            },
+        )
+        if not allowed:
+            logger.warning(
+                "SELL bloqueado para preservar reserva de saldo.",
+                extra={
+                    "event": "skip_sell_risk_balance",
+                    "token_balance": token_balance,
+                    "max_usable_tokens": round(max_usable_tokens, 4),
+                    "required": quote.size,
+                },
+            )
+        return allowed
+
     def _matches_quote(self, order: dict[str, Any], quote: Quote) -> bool:
         order_price = self._extract_price(order)
         order_size = self._extract_size(order)
-
         if order_price is None or order_size is None:
             return False
 
@@ -418,13 +753,13 @@ class MarketMakerBot:
         order_id = self.client.extract_order_id(response)
         if order_id:
             self.known_orders[order_id] = self._build_order_snapshot(response)
+            self._save_state()
 
     def _remember_orders(self, orders: list[dict[str, Any]]) -> None:
         for order in orders:
             order_id = self.client.extract_order_id(order)
-            if not order_id:
-                continue
-            self.known_orders[order_id] = self._build_order_snapshot(order)
+            if order_id:
+                self.known_orders[order_id] = self._build_order_snapshot(order)
 
     def _build_order_snapshot(self, order: dict[str, Any]) -> dict[str, Any]:
         return {

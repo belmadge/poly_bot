@@ -21,6 +21,9 @@ class Settings:
     min_collateral_buffer: float
     target_position_size: float
     max_position_imbalance: float
+    max_position_size: float
+    max_balance_usage_pct: float
+    price_refresh_threshold: float
     auto_select_market: bool
     market_scan_limit: int
     dynamic_spread_enabled: bool
@@ -28,10 +31,15 @@ class Settings:
     max_spread: float
     liquidity_target_low: float
     liquidity_target_high: float
+    low_volatility_threshold: float
+    high_volatility_threshold: float
+    low_volatility_spread_multiplier: float
+    high_volatility_spread_multiplier: float
     max_retries: int
     retry_delay_seconds: float
     log_level: str
     log_format: str
+    state_file: str
     api_key: str | None = None
     api_secret: str | None = None
     api_passphrase: str | None = None
@@ -79,6 +87,9 @@ def load_settings() -> Settings:
             min_collateral_buffer=float(os.getenv("MIN_COLLATERAL_BUFFER", "1.0")),
             target_position_size=float(os.getenv("TARGET_POSITION_SIZE", "0")),
             max_position_imbalance=float(os.getenv("MAX_POSITION_IMBALANCE", os.getenv("SIZE", "10"))),
+            max_position_size=float(os.getenv("MAX_POSITION_SIZE", os.getenv("SIZE", "10"))),
+            max_balance_usage_pct=float(os.getenv("MAX_BALANCE_USAGE_PCT", "0.9")),
+            price_refresh_threshold=float(os.getenv("PRICE_REFRESH_THRESHOLD", "0.01")),
             auto_select_market=_parse_bool("AUTO_SELECT_MARKET", True),
             market_scan_limit=int(os.getenv("MARKET_SCAN_LIMIT", "25")),
             dynamic_spread_enabled=_parse_bool("DYNAMIC_SPREAD_ENABLED", True),
@@ -86,10 +97,15 @@ def load_settings() -> Settings:
             max_spread=float(os.getenv("MAX_SPREAD", str(max(float(os.getenv("SPREAD", "0.02")) * 2, 0.02)))),
             liquidity_target_low=float(os.getenv("LIQUIDITY_TARGET_LOW", os.getenv("SIZE", "10"))),
             liquidity_target_high=float(os.getenv("LIQUIDITY_TARGET_HIGH", str(max(float(os.getenv("SIZE", "10")) * 5, 10.0)))),
+            low_volatility_threshold=float(os.getenv("LOW_VOLATILITY_THRESHOLD", "0.002")),
+            high_volatility_threshold=float(os.getenv("HIGH_VOLATILITY_THRESHOLD", "0.01")),
+            low_volatility_spread_multiplier=float(os.getenv("LOW_VOLATILITY_SPREAD_MULTIPLIER", "0.85")),
+            high_volatility_spread_multiplier=float(os.getenv("HIGH_VOLATILITY_SPREAD_MULTIPLIER", "1.4")),
             max_retries=int(os.getenv("MAX_RETRIES", "3")),
             retry_delay_seconds=float(os.getenv("RETRY_DELAY_SECONDS", "2")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            log_format=os.getenv("LOG_FORMAT", "json"),
+            log_format=os.getenv("LOG_FORMAT", "text"),
+            state_file=os.getenv("STATE_FILE", "bot_state.json"),
             api_key=os.getenv("CLOB_API_KEY"),
             api_secret=os.getenv("CLOB_SECRET"),
             api_passphrase=os.getenv("CLOB_PASS_PHRASE"),
