@@ -208,9 +208,34 @@ class PolymarketClient:
     def _call_client(self, target: Any, method_name: str, **kwargs: Any) -> Any:
         try:
             method = getattr(target, method_name)
-            return method(**kwargs)
+            result = method(**kwargs)
+            
+            # FAIL-SAFE: Validate API response is not None/empty for critical methods
+            if method_name in {
+                "get_open_orders",
+                "get_orders",
+                "list_orders",
+                "list_open_orders",
+                "get_collateral_balance",
+                "get_token_balance",
+            }:
+                if result is None:
+                    logger.warning(
+                        "API response nula para metodo critico",
+                        extra={"event": "api_null_response", "method": method_name},
+                    )
+                    raise PolymarketApiError(f"API returned None for {method_name}")
+            
+            return result
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Falha na chamada CLOB", extra={"method": method_name, "params": kwargs})
+            logger.exception(
+                "Falha na chamada CLOB",
+                extra={
+                    "method": method_name,
+                    "params": kwargs,
+                    "error_type": type(exc).__name__,
+                },
+            )
             raise PolymarketApiError(f"CLOB call failed: {method_name}") from exc
 
     def _discover_token_ids(self) -> list[str]:

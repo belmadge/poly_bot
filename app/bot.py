@@ -62,8 +62,27 @@ class MarketMakerBot:
         self.last_api_sync_time: float = time.time()
 
     def run_once(self) -> None:
-        # CRITICAL: Synchronize with API - ensure API is source of truth
-        self._sync_orders_with_api()
+        # HARDENING: Synchronize with API - ensure API is source of truth
+        try:
+            self._sync_orders_with_api()
+        except PolymarketApiError as exc:
+            logger.critical(
+                "FAIL-SAFE: API sync failed at cycle start - stopping iteration",
+                extra={
+                    "event": "cycle_start_api_sync_failed",
+                    "error": str(exc),
+                },
+            )
+            raise
+        
+        # HARDENING: Validate state consistency early
+        if not self._validate_state_consistency():
+            logger.critical(
+                "FAIL-SAFE: State inconsistency detected at cycle start",
+                extra={"event": "cycle_start_state_invalid"},
+            )
+            self._save_state()
+            raise PolymarketApiError("State consistency check failed")
         
         # Check balance thresholds
         if not self._check_balance_safety():
@@ -85,6 +104,13 @@ class MarketMakerBot:
                     "token_balance": token_balance,
                     "filled_count": len(filled_orders),
                 },
+            )
+        
+        # HARDENING: Verify position hedges after fills
+        if not self._validate_position_hedges():
+            logger.warning(
+                "Hedge validation falhou durante ciclo",
+                extra={"event": "cycle_hedge_validation_failed"},
             )
 
         # SMART CANCELLATION: Only cancel orders if needed (price moved significantly or orders out of sync)
@@ -109,6 +135,13 @@ class MarketMakerBot:
         self._place_quotes(context, execution_plan, token_balance, remaining_open_orders)
         self.last_market_prices[context.token_id] = context.current_price
         
+        # HARDENING: Final state consistency check
+        if not self._validate_state_consistency():
+            logger.warning(
+                "HARDENING: State inconsistency detected at cycle end - but cycle complete",
+                extra={"event": "cycle_end_state_validation_warning"},
+            )
+        
         # Log performance metrics periodically
         self._log_performance_metrics()
         
@@ -123,11 +156,19 @@ class MarketMakerBot:
                 "token_id": self.settings.token_id,
             },
         )
+        cycle_count = 0
         while True:
+            cycle_count += 1
+            
             # Check kill switch
             if self._check_kill_switch():
                 logger.critical("KILL SWITCH ACTIVATED. Shutting down bot.", extra={"event": "kill_switch"})
                 break
+            
+            logger.info(
+                "Iniciando ciclo de execucao",
+                extra={"event": "cycle_start", "cycle_number": cycle_count},
+            )
                 
             try:
                 self.run_once()
@@ -135,6 +176,14 @@ class MarketMakerBot:
                 self.consecutive_api_errors = 0
                 self.consecutive_execution_errors = 0
                 self.last_api_error_time = 0.0
+                logger.info(
+                    "Ciclo completo com sucesso",
+                    extra={
+                        "event": "cycle_success",
+                        "cycle_number": cycle_count,
+                        "open_orders": len(self.known_orders),
+                    },
+                )
             except KeyboardInterrupt:
                 logger.info("Bot interrompido pelo usuario.", extra={"event": "shutdown"})
                 break
@@ -148,15 +197,18 @@ class MarketMakerBot:
                         "error": str(exc),
                         "consecutive_errors": self.consecutive_api_errors,
                         "max_allowed": self.settings.max_api_failure_streak,
+                        "cycle_number": cycle_count,
                     },
                 )
-                # Check if we've exceeded max API failures
+                
+                # Validate error streak
                 if self.consecutive_api_errors >= self.settings.max_api_failure_streak:
                     logger.critical(
                         "KILL SWITCH: Max API failures exceeded",
                         extra={
                             "event": "kill_switch_api_failures",
                             "consecutive_errors": self.consecutive_api_errors,
+                            "limit": self.settings.max_api_failure_streak,
                         },
                     )
                     self._save_state()
@@ -166,24 +218,36 @@ class MarketMakerBot:
                 logger.exception(
                     "Erro inesperado no loop principal",
                     extra={
-                        "event": "unexpected",
+                        "event": "unexpected_error",
                         "error": str(exc),
+                        "error_type": type(exc).__name__,
                         "consecutive_errors": self.consecutive_execution_errors,
+                        "limit": self.settings.max_consecutive_errors,
+                        "cycle_number": cycle_count,
                     },
                 )
-                # Check if we've exceeded max execution errors
+                
+                # Validate error streak
                 if self.consecutive_execution_errors >= self.settings.max_consecutive_errors:
                     logger.critical(
                         "KILL SWITCH: Max execution errors exceeded",
                         extra={
                             "event": "kill_switch_exec_errors",
                             "consecutive_errors": self.consecutive_execution_errors,
+                            "limit": self.settings.max_consecutive_errors,
                         },
                     )
                     self._save_state()
                     break
             finally:
                 self._save_state()
+                logger.info(
+                    "Ciclo encerrado; aguardando proximo intervalo",
+                    extra={
+                        "event": "cycle_end",
+                        "sleep_seconds": self.settings.loop_interval_seconds,
+                    },
+                )
                 time.sleep(self.settings.loop_interval_seconds)
 
     def list_open_orders(self, token_id: str | None = None) -> list[dict[str, Any]]:
@@ -224,16 +288,54 @@ class MarketMakerBot:
             logger.info("Nenhuma ordem aberta para cancelar.", extra={"event": "cancel_skip"})
             return None
 
-        cancel_resp = self._with_retry(lambda: self.client.cancel_orders(order_ids))
-        for order_id in order_ids:
-            self.known_orders.pop(order_id, None)
-
         logger.info(
-            "Ordens canceladas",
-            extra={"event": "cancel", "count": len(order_ids), "order_ids": order_ids},
+            "CANCELAMENTO: Iniciando cancelamento de ordens",
+            extra={
+                "event": "cancel_start",
+                "count": len(order_ids),
+                "order_ids": order_ids,
+            },
         )
-        self._save_state()
-        return cancel_resp
+        
+        try:
+            cancel_resp = self._with_retry(lambda: self.client.cancel_orders(order_ids))
+            
+            # Remove from local tracking
+            for order_id in order_ids:
+                removed = self.known_orders.pop(order_id, None)
+                if removed:
+                    logger.info(
+                        "Ordem removida do estado local apos cancelamento",
+                        extra={
+                            "event": "order_removed_from_state",
+                            "order_id": order_id,
+                            "token_id": removed.get("token_id"),
+                            "side": removed.get("side"),
+                        },
+                    )
+
+            logger.info(
+                "CANCELAMENTO: Sucesso",
+                extra={
+                    "event": "cancel_success",
+                    "count": len(order_ids),
+                    "order_ids": order_ids,
+                },
+            )
+            self._save_state()
+            return cancel_resp
+        except PolymarketApiError as exc:
+            logger.exception(
+                "FAIL-SAFE: Falha ao cancelar ordens",
+                extra={
+                    "event": "cancel_failed",
+                    "count": len(order_ids),
+                    "error": str(exc),
+                },
+            )
+            # DON'T remove from local state if API call failed
+            # This keeps consistency
+            raise
 
     def _with_retry(self, operation: Any) -> Any:
         attempt = 0
@@ -296,6 +398,15 @@ class MarketMakerBot:
         token_balance: float | None,
         open_orders: list[dict[str, Any]],
     ) -> None:
+        """Place quotes with comprehensive pre-order validation."""
+        # HARDENING: Pre-order validation BEFORE placing any orders
+        if not self._pre_order_validation(context, execution_plan):
+            logger.warning(
+                "PRE-ORDER: Validacao falhou - pulando colocacao de ordens neste ciclo",
+                extra={"event": "place_quotes_validation_failed"},
+            )
+            return
+        
         self._place_quote_if_allowed(context.token_id, execution_plan.buy, token_balance, open_orders)
         self._place_quote_if_allowed(context.token_id, execution_plan.sell, token_balance, open_orders)
 
@@ -306,63 +417,126 @@ class MarketMakerBot:
         token_balance: float | None,
         open_orders: list[dict[str, Any]],
     ) -> None:
+        decision_context = {
+            "token_id": token_id,
+            "side": quote.side,
+            "price": quote.price,
+            "size": quote.size,
+        }
+        
+        # Check 1: Duplicate detection
         if self._has_duplicate_open_order(open_orders, quote):
-            logger.info(
-                "Ordem duplicada detectada no preco alvo; criacao ignorada.",
-                extra={
-                    "event": "dedupe",
-                    "token_id": token_id,
-                    "side": quote.side,
-                    "price": quote.price,
-                    "size": quote.size,
+            self._log_decision(
+                "duplicate_order_check",
+                False,
+                {
+                    **decision_context,
+                    "reason": "Ordem duplicada detectada no preco alvo",
                 },
             )
             return
 
+        # Check 2: Position allows side
         if not self._position_allows_side(quote.side, token_balance):
-            logger.info(
-                "Ordem bloqueada por controle de posicao.",
-                extra={"event": "skip_position", "token_id": token_id, "side": quote.side, "price": quote.price},
+            self._log_decision(
+                "position_check",
+                False,
+                {
+                    **decision_context,
+                    "reason": "Posicao nao permite este lado",
+                    "token_balance": token_balance,
+                },
             )
             return
 
+        # Check 3: Risk allows order
         if not self._risk_allows_order(token_id, quote, token_balance):
+            self._log_decision(
+                "risk_check",
+                False,
+                {**decision_context, "reason": "Falha em verificacao de risco"},
+            )
             return
 
+        # Check 4: Buy balance
         if quote.side == "buy" and not self._has_buy_balance(quote):
-            logger.warning(
-                "Saldo insuficiente para BUY, ordem pulada.",
-                extra={"event": "skip_buy_no_balance", "token_id": token_id, "price": quote.price, "size": quote.size},
+            self._log_decision(
+                "buy_balance_check",
+                False,
+                {
+                    **decision_context,
+                    "reason": "Saldo insuficiente para BUY",
+                    "required": (quote.price * quote.size) + self.settings.min_collateral_buffer,
+                    "available": self._with_retry(self.client.get_collateral_balance),
+                },
             )
             return
 
+        # Check 5: Sell balance
         if quote.side == "sell" and not self._has_sell_balance(quote):
-            logger.warning(
-                "Saldo/posicao insuficiente para SELL, ordem pulada.",
-                extra={"event": "skip_sell_no_balance", "token_id": token_id, "price": quote.price, "size": quote.size},
+            self._log_decision(
+                "sell_balance_check",
+                False,
+                {
+                    **decision_context,
+                    "reason": "Saldo/posicao insuficiente para SELL",
+                    "required": quote.size,
+                    "available": token_balance,
+                },
             )
             return
 
-        response = self._with_retry(
-            lambda: self.client.place_limit_order(
-                token_id=token_id,
-                side=quote.side,
-                price=quote.price,
-                size=quote.size,
+        # All checks passed - place order
+        try:
+            response = self._with_retry(
+                lambda: self.client.place_limit_order(
+                    token_id=token_id,
+                    side=quote.side,
+                    price=quote.price,
+                    size=quote.size,
+                )
             )
-        )
-        self._track_order_id(response)
-        logger.info(
-            "Ordem criada",
-            extra={
-                "event": "place_order",
-                "token_id": token_id,
-                "side": quote.side,
-                "price": quote.price,
-                "size": quote.size,
-                "order_id": self.client.extract_order_id(response),
-            },
-        )
+            self._track_order_id(response)
+            
+            self._log_decision(
+                "place_order",
+                True,
+                {
+                    **decision_context,
+                    "order_id": self.client.extract_order_id(response),
+                    "reason": "Todas as verificacoes passaram",
+                },
+            )
+            
+            logger.info(
+                "Ordem criada com sucesso",
+                extra={
+                    "event": "place_order",
+                    "token_id": token_id,
+                    "side": quote.side,
+                    "price": quote.price,
+                    "size": quote.size,
+                    "order_id": self.client.extract_order_id(response),
+                },
+            )
+        except PolymarketApiError as exc:
+            self._log_decision(
+                "place_order",
+                False,
+                {
+                    **decision_context,
+                    "reason": f"Erro ao criar ordem: {str(exc)}",
+                },
+            )
+            logger.exception(
+                "Falha ao criar ordem",
+                extra={
+                    "event": "place_order_failed",
+                    "token_id": token_id,
+                    "side": quote.side,
+                    "error": str(exc),
+                },
+            )
 
     def _build_execution_plan(self, context: QuoteContext) -> ExecutionPlan:
         net_position = self._get_net_position(context.token_id)
@@ -890,8 +1064,339 @@ class MarketMakerBot:
             "raw": order,
         }
 
-    # ========== KILL SWITCH IMPLEMENTATION ==========
-    def _check_kill_switch(self) -> bool:
+    # ========== FAIL-SAFE SYSTEM: State Consistency ==========
+    def _validate_state_consistency(self) -> bool:
+        """
+        FAIL-SAFE: Detect state inconsistencies.
+        Compares local state against API reality.
+        Returns False if critical inconsistency detected.
+        """
+        try:
+            api_orders = self._with_retry(
+                lambda: self.client.get_open_orders(self.current_token_id)
+            )
+            api_order_ids = {
+                self.client.extract_order_id(order)
+                for order in api_orders
+                if self.client.extract_order_id(order)
+            }
+            
+            local_order_ids = set(self.known_orders.keys())
+            
+            # Check for ghost orders (local but not on API)
+            ghost_orders = local_order_ids - api_order_ids
+            if ghost_orders:
+                logger.warning(
+                    "INCONSISTENCIA: Ordens ghost encontradas (local mas nao na API)",
+                    extra={
+                        "event": "state_inconsistency_ghost_orders",
+                        "ghost_count": len(ghost_orders),
+                        "ghost_ids": list(ghost_orders)[:5],  # Log first 5
+                    },
+                )
+            
+            # Check for unknown orders (API but not local)
+            unknown_orders = api_order_ids - local_order_ids
+            if unknown_orders:
+                logger.warning(
+                    "INCONSISTENCIA: Ordens desconhecidas encontradas (API mas nao local)",
+                    extra={
+                        "event": "state_inconsistency_unknown_orders",
+                        "unknown_count": len(unknown_orders),
+                    },
+                )
+                # Import these orders into known_orders
+                for order in api_orders:
+                    order_id = self.client.extract_order_id(order)
+                    if order_id in unknown_orders:
+                        self.known_orders[order_id] = self._build_order_snapshot(order)
+                        logger.info(
+                            "Ordem desconhecida importada para estado local",
+                            extra={
+                                "event": "unknown_order_imported",
+                                "order_id": order_id,
+                            },
+                        )
+            
+            # Detailed price validation
+            for order_id, api_order in zip(
+                [self.client.extract_order_id(o) for o in api_orders],
+                api_orders,
+            ):
+                if order_id not in self.known_orders:
+                    continue
+                    
+                local_data = self.known_orders[order_id]
+                api_price = self._extract_price(api_order)
+                local_price = local_data.get("price")
+                
+                if api_price and local_price:
+                    price_diff = abs(api_price - local_price)
+                    if price_diff > 0.01:  # Price mismatch > $0.01
+                        logger.warning(
+                            "Inconsistencia de preco detectada",
+                            extra={
+                                "event": "price_mismatch",
+                                "order_id": order_id,
+                                "api_price": api_price,
+                                "local_price": local_price,
+                                "diff": price_diff,
+                            },
+                        )
+            
+            # If ghost orders exceed threshold, it's critical
+            if len(ghost_orders) > 5:
+                logger.critical(
+                    "FAIL-SAFE: Inconsistencia critica de estado detectada",
+                    extra={
+                        "event": "critical_state_inconsistency",
+                        "ghost_count": len(ghost_orders),
+                    },
+                )
+                return False
+                
+            return True
+            
+        except PolymarketApiError as exc:
+            logger.exception(
+                "Falha ao validar consistencia de estado",
+                extra={"event": "state_validation_failed", "error": str(exc)},
+            )
+            return False
+
+    # ========== POSITION SAFETY: Hedge Detection & Auto-Hedge ==========
+    def _validate_position_hedges(self) -> bool:
+        """
+        POSITION SAFETY: Ensure all positions have opposite hedges.
+        If unhedged position detected for too long, create hedge automatically.
+        """
+        unhedged_positions: dict[str, tuple[str, float]] = {}
+        
+        for token_id, net_position in self.net_positions.items():
+            if net_position == 0:
+                continue
+            
+            # Position is long (positive) - need SELL hedge
+            if net_position > 0:
+                has_sell_order = any(
+                    self._extract_side(order) == "sell"
+                    for order in [
+                        self.known_orders[oid]["raw"]
+                        for oid in self.known_orders
+                        if self.known_orders[oid].get("token_id") == token_id
+                    ]
+                    if "raw" in self.known_orders.get(oid, {})
+                )
+                if not has_sell_order:
+                    unhedged_positions[token_id] = ("sell", net_position)
+                    logger.warning(
+                        "POSITION SAFETY: Posicao LONG sem hedge SELL",
+                        extra={
+                            "event": "unhedged_position_long",
+                            "token_id": token_id,
+                            "position_size": net_position,
+                        },
+                    )
+            
+            # Position is short (negative) - need BUY hedge
+            elif net_position < 0:
+                has_buy_order = any(
+                    self._extract_side(order) == "buy"
+                    for order in [
+                        self.known_orders[oid]["raw"]
+                        for oid in self.known_orders
+                        if self.known_orders[oid].get("token_id") == token_id
+                    ]
+                    if "raw" in self.known_orders.get(oid, {})
+                )
+                if not has_buy_order:
+                    unhedged_positions[token_id] = ("buy", abs(net_position))
+                    logger.warning(
+                        "POSITION SAFETY: Posicao SHORT sem hedge BUY",
+                        extra={
+                            "event": "unhedged_position_short",
+                            "token_id": token_id,
+                            "position_size": net_position,
+                        },
+                    )
+        
+        if not unhedged_positions:
+            return True
+        
+        # Try to auto-hedge unhedged positions
+        logger.info(
+            "POSITION SAFETY: Criando hedges automaticamente",
+            extra={
+                "event": "auto_hedge_start",
+                "unhedged_count": len(unhedged_positions),
+            },
+        )
+        
+        for token_id, (hedge_side, hedge_size) in unhedged_positions.items():
+            try:
+                # Get current price for hedge placement
+                market = self._with_retry(
+                    lambda token_id=token_id: self.client.get_market_snapshot(token_id)
+                )
+                base_price = market["midpoint"]
+                
+                # Place hedge order slightly worse (more conservative)
+                if hedge_side == "buy":
+                    hedge_price = max(0.001, base_price - 0.01)  # 1 cent worse for buy
+                else:
+                    hedge_price = min(0.999, base_price + 0.01)  # 1 cent worse for sell
+                
+                response = self._with_retry(
+                    lambda: self.client.place_limit_order(
+                        token_id=token_id,
+                        side=hedge_side,
+                        price=round(hedge_price, 4),
+                        size=round(hedge_size, 4),
+                    )
+                )
+                
+                self._track_order_id(response)
+                logger.info(
+                    "POSITION SAFETY: Hedge criado automaticamente",
+                    extra={
+                        "event": "auto_hedge_success",
+                        "token_id": token_id,
+                        "hedge_side": hedge_side,
+                        "hedge_size": hedge_size,
+                        "hedge_price": hedge_price,
+                        "order_id": self.client.extract_order_id(response),
+                    },
+                )
+            except PolymarketApiError as exc:
+                logger.exception(
+                    "FAIL-SAFE: Falha ao criar hedge automatico",
+                    extra={
+                        "event": "auto_hedge_failed",
+                        "token_id": token_id,
+                        "error": str(exc),
+                    },
+                )
+                return False
+        
+        return True
+
+    # ========== PRE-ORDER SYNCHRONIZATION & VALIDATION ==========
+    def _pre_order_validation(self, context: QuoteContext, execution_plan: ExecutionPlan) -> bool:
+        """
+        Validate before placing ANY order:
+        1. Synchronize with API
+        2. Check state consistency
+        3. Verify position hedges
+        4. Confirm balance
+        5. Log all decisions
+        """
+        logger.info(
+            "PRE-ORDER: Iniciando validacao completa",
+            extra={
+                "event": "pre_order_validation_start",
+                "token_id": context.token_id,
+                "plan_buy_price": execution_plan.buy.price,
+                "plan_sell_price": execution_plan.sell.price,
+            },
+        )
+        
+        # 1. Sync with API
+        try:
+            self._sync_orders_with_api()
+            logger.info(
+                "PRE-ORDER: Sincronizacao com API completa",
+                extra={
+                    "event": "pre_order_api_sync_ok",
+                    "open_orders": len(self.known_orders),
+                },
+            )
+        except PolymarketApiError as exc:
+            logger.critical(
+                "PRE-ORDER: Falha na sincronizacao com API - bloqueando ordens",
+                extra={
+                    "event": "pre_order_api_sync_failed",
+                    "error": str(exc),
+                },
+            )
+            return False
+        
+        # 2. Check state consistency
+        if not self._validate_state_consistency():
+            logger.critical(
+                "PRE-ORDER: Inconsistencia de estado detectada - bloqueando ordens",
+                extra={"event": "pre_order_state_invalid"},
+            )
+            return False
+        
+        logger.info(
+            "PRE-ORDER: Consistencia de estado validada",
+            extra={"event": "pre_order_state_ok"},
+        )
+        
+        # 3. Verify position hedges
+        if not self._validate_position_hedges():
+            logger.critical(
+                "PRE-ORDER: Falha ao validar hedges de posicao - bloqueando ordens",
+                extra={"event": "pre_order_hedge_validation_failed"},
+            )
+            return False
+        
+        logger.info(
+            "PRE-ORDER: Hedges de posicao validados",
+            extra={"event": "pre_order_hedges_ok"},
+        )
+        
+        # 4. Confirm balance
+        collateral = self._with_retry(self.client.get_collateral_balance)
+        token_balance = self._get_token_balance()
+        
+        if collateral is None or token_balance is None:
+            logger.warning(
+                "PRE-ORDER: Nao foi possivel confirmar balance - prosseguindo com cautela",
+                extra={
+                    "event": "pre_order_balance_unknown",
+                    "collateral": collateral,
+                    "token_balance": token_balance,
+                },
+            )
+        else:
+            required_buy = (execution_plan.buy.price * execution_plan.buy.size) + self.settings.min_collateral_buffer
+            required_sell = execution_plan.sell.size
+            
+            logger.info(
+                "PRE-ORDER: Balance confirmado",
+                extra={
+                    "event": "pre_order_balance_confirmed",
+                    "collateral": collateral,
+                    "required_for_buy": required_buy,
+                    "token_balance": token_balance,
+                    "required_for_sell": required_sell,
+                    "buy_feasible": collateral >= required_buy,
+                    "sell_feasible": token_balance >= required_sell,
+                },
+            )
+        
+        logger.info(
+            "PRE-ORDER: Todas as validacoes completas - pronto para criar ordens",
+            extra={"event": "pre_order_validation_ok"},
+        )
+        
+        return True
+
+    # ========== DECISION LOGGING: Log all critical decisions ==========
+    def _log_decision(self, decision_type: str, decision: bool, details: dict[str, Any]) -> None:
+        """
+        Log every critical decision for audit trail.
+        CRITICAL FOR DEBUGGING AND COMPLIANCE.
+        """
+        logger.info(
+            f"DECISAO: {decision_type}",
+            extra={
+                "event": f"decision_{decision_type.lower()}",
+                "decision": "ACEITA" if decision else "REJEITADA",
+                **details,
+            },
+        )
         """Check if kill switch should be activated."""
         # Check manual kill switch flag file
         flag_file_path = Path(self.settings.kill_switch_flag_file)
