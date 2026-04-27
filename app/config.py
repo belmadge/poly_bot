@@ -16,6 +16,8 @@ class Settings:
     size: float
     loop_interval_seconds: int
     tick_size: str
+    price_tolerance: float
+    min_collateral_buffer: float
     api_key: str | None = None
     api_secret: str | None = None
     api_passphrase: str | None = None
@@ -45,6 +47,8 @@ def load_settings() -> Settings:
             size=float(os.getenv("SIZE", "10")),
             loop_interval_seconds=int(os.getenv("LOOP_INTERVAL_SECONDS", "300")),
             tick_size=os.getenv("TICK_SIZE", "0.01"),
+            price_tolerance=float(os.getenv("PRICE_TOLERANCE", "0.0001")),
+            min_collateral_buffer=float(os.getenv("MIN_COLLATERAL_BUFFER", "1.0")),
             api_key=os.getenv("CLOB_API_KEY"),
             api_secret=os.getenv("CLOB_SECRET"),
             api_passphrase=os.getenv("CLOB_PASS_PHRASE"),

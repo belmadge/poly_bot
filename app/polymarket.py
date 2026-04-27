@@ -14,6 +14,10 @@ from py_clob_client_v2 import (
 
 from app.config import Settings
 
+OPEN_STATUSES = {"open", "live", "active", "resting", "unfilled", "pending"}
+FILLED_STATUSES = {"filled", "matched", "executed", "complete", "completed"}
+CLOSED_STATUSES = FILLED_STATUSES | {"canceled", "cancelled", "expired", "rejected"}
+
 
 class PolymarketClient:
     def __init__(self, settings: Settings) -> None:
@@ -49,40 +53,148 @@ class PolymarketClient:
         )
 
     def get_current_price(self, token_id: str) -> float:
-        # Tentativas de compatibilidade entre versões da lib.
-        client = self.client
+        if hasattr(self.client, "get_midpoint_price"):
+            return self._extract_price(self.client.get_midpoint_price(token_id=token_id))
 
-        if hasattr(client, "get_midpoint_price"):
-            result = client.get_midpoint_price(token_id=token_id)
-            return self._extract_price(result)
-
-        if hasattr(client, "get_price"):
-            result = client.get_price(token_id=token_id)
-            return self._extract_price(result)
+        if hasattr(self.client, "get_price"):
+            return self._extract_price(self.client.get_price(token_id=token_id))
 
         for getter_name in ("get_book", "get_order_book"):
-            if hasattr(client, getter_name):
-                book = getattr(client, getter_name)(token_id=token_id)
+            if hasattr(self.client, getter_name):
+                book = getattr(self.client, getter_name)(token_id=token_id)
                 return self._mid_from_book(book)
 
-        raise RuntimeError(
-            "Unable to fetch current price: no compatible price method found in py-clob-client-v2."
-        )
+        raise RuntimeError("Unable to fetch current price with current py-clob-client-v2 version.")
+
+    def get_open_orders(self, token_id: str) -> list[dict[str, Any]]:
+        candidates = [
+            ("get_open_orders", {"token_id": token_id}),
+            ("get_orders", {"token_id": token_id}),
+            ("get_orders", {"market": token_id}),
+            ("list_orders", {"token_id": token_id}),
+            ("list_open_orders", {"token_id": token_id}),
+        ]
+
+        for method_name, kwargs in candidates:
+            if not hasattr(self.client, method_name):
+                continue
+            payload = getattr(self.client, method_name)(**kwargs)
+            raw_orders = self._extract_list(payload, keys=("orders", "data", "items", "results"))
+            orders = [self._to_dict(item) for item in raw_orders]
+            if method_name in {"get_open_orders", "list_open_orders"}:
+                return orders
+            return [o for o in orders if self._extract_status(o) in OPEN_STATUSES]
+
+        return []
+
+    def cancel_orders(self, order_ids: list[str]) -> dict[str, Any]:
+        if not order_ids:
+            return {"cancelled": [], "raw": None}
+
+        for method_name, key_name in (
+            ("cancel_orders", "order_ids"),
+            ("cancel_orders", "ids"),
+            ("cancel", "order_ids"),
+            ("batch_cancel_orders", "order_ids"),
+        ):
+            if hasattr(self.client, method_name):
+                payload = getattr(self.client, method_name)(**{key_name: order_ids})
+                return {"cancelled": order_ids, "raw": self._to_dict(payload)}
+
+        if hasattr(self.client, "cancel_order"):
+            raw: list[dict[str, Any]] = []
+            for order_id in order_ids:
+                raw.append(self._to_dict(self.client.cancel_order(order_id=order_id)))
+            return {"cancelled": order_ids, "raw": raw}
+
+        raise RuntimeError("Cancel method not available in current py-clob-client-v2 version.")
+
+    def get_order_details(self, order_id: str) -> dict[str, Any] | None:
+        for method_name in ("get_order", "get_order_by_id"):
+            if hasattr(self.client, method_name):
+                payload = getattr(self.client, method_name)(order_id=order_id)
+                return self._to_dict(payload)
+        return None
+
+    def get_collateral_balance(self) -> float | None:
+        candidates = [
+            ("get_collateral_balance", {}),
+            ("get_balance", {}),
+            ("get_usdc_balance", {}),
+        ]
+        for method_name, kwargs in candidates:
+            if hasattr(self.client, method_name):
+                payload = getattr(self.client, method_name)(**kwargs)
+                return self._extract_balance(payload)
+        return None
+
+    def get_token_balance(self, token_id: str) -> float | None:
+        for method_name in ("get_token_balance", "get_balance"):
+            if not hasattr(self.client, method_name):
+                continue
+            payload = getattr(self.client, method_name)(token_id=token_id)
+            extracted = self._extract_balance(payload)
+            if extracted is not None:
+                return extracted
+
+        if hasattr(self.client, "get_positions"):
+            payload = self.client.get_positions()
+            positions = self._extract_list(payload, keys=("positions", "data", "items"))
+            for pos in positions:
+                parsed = self._to_dict(pos)
+                if str(parsed.get("token_id")) == str(token_id):
+                    return self._extract_balance(parsed)
+
+        return None
 
     def place_limit_order(self, token_id: str, side: str, price: float, size: float) -> dict[str, Any]:
         enum_side = Side.BUY if side.lower() == "buy" else Side.SELL
-
         response = self.client.create_and_post_order(
-            order_args=OrderArgs(
-                token_id=token_id,
-                price=price,
-                side=enum_side,
-                size=size,
-            ),
+            order_args=OrderArgs(token_id=token_id, price=price, side=enum_side, size=size),
             options=PartialCreateOrderOptions(tick_size=self.settings.tick_size),
             order_type=OrderType.GTC,
         )
         return self._to_dict(response)
+
+    @staticmethod
+    def _extract_list(payload: Any, keys: tuple[str, ...]) -> list[Any]:
+        if isinstance(payload, list):
+            return payload
+
+        normalized = PolymarketClient._to_dict(payload)
+        for key in keys:
+            if key in normalized and isinstance(normalized[key], list):
+                return normalized[key]
+        return []
+
+    @staticmethod
+    def _extract_status(order: dict[str, Any]) -> str:
+        for key in ("status", "state", "order_status"):
+            if key in order and order[key] is not None:
+                return str(order[key]).lower()
+        return ""
+
+    @staticmethod
+    def extract_order_id(order: dict[str, Any]) -> str | None:
+        for key in ("order_id", "id", "hash", "orderHash"):
+            value = order.get(key)
+            if value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _extract_balance(payload: Any) -> float | None:
+        if payload is None:
+            return None
+        if isinstance(payload, (int, float, str)):
+            return float(payload)
+
+        normalized = PolymarketClient._to_dict(payload)
+        for key in ("available", "balance", "amount", "free", "value", "size"):
+            value = normalized.get(key)
+            if value is not None:
+                return float(value)
+        return None
 
     @staticmethod
     def _to_dict(payload: Any) -> dict[str, Any]:
