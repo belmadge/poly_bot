@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict
 from typing import Any
 
@@ -14,9 +15,15 @@ from py_clob_client_v2 import (
 
 from app.config import Settings
 
+logger = logging.getLogger(__name__)
+
 OPEN_STATUSES = {"open", "live", "active", "resting", "unfilled", "pending"}
 FILLED_STATUSES = {"filled", "matched", "executed", "complete", "completed"}
 CLOSED_STATUSES = FILLED_STATUSES | {"canceled", "cancelled", "expired", "rejected"}
+
+
+class PolymarketApiError(RuntimeError):
+    """Erro de integração com a API Polymarket CLOB."""
 
 
 class PolymarketClient:
@@ -43,7 +50,7 @@ class PolymarketClient:
             chain_id=self.settings.chain_id,
             key=self.settings.private_key,
         )
-        creds = l1_client.create_or_derive_api_key()
+        creds = self._call_client(l1_client, "create_or_derive_api_key")
 
         return ClobClient(
             host=self.settings.host,
@@ -54,17 +61,17 @@ class PolymarketClient:
 
     def get_current_price(self, token_id: str) -> float:
         if hasattr(self.client, "get_midpoint_price"):
-            return self._extract_price(self.client.get_midpoint_price(token_id=token_id))
+            return self._extract_price(self._call_client(self.client, "get_midpoint_price", token_id=token_id))
 
         if hasattr(self.client, "get_price"):
-            return self._extract_price(self.client.get_price(token_id=token_id))
+            return self._extract_price(self._call_client(self.client, "get_price", token_id=token_id))
 
         for getter_name in ("get_book", "get_order_book"):
             if hasattr(self.client, getter_name):
-                book = getattr(self.client, getter_name)(token_id=token_id)
+                book = self._call_client(self.client, getter_name, token_id=token_id)
                 return self._mid_from_book(book)
 
-        raise RuntimeError("Unable to fetch current price with current py-clob-client-v2 version.")
+        raise PolymarketApiError("Unable to fetch current price with current py-clob-client-v2 version.")
 
     def get_open_orders(self, token_id: str) -> list[dict[str, Any]]:
         candidates = [
@@ -78,7 +85,7 @@ class PolymarketClient:
         for method_name, kwargs in candidates:
             if not hasattr(self.client, method_name):
                 continue
-            payload = getattr(self.client, method_name)(**kwargs)
+            payload = self._call_client(self.client, method_name, **kwargs)
             raw_orders = self._extract_list(payload, keys=("orders", "data", "items", "results"))
             orders = [self._to_dict(item) for item in raw_orders]
             if method_name in {"get_open_orders", "list_open_orders"}:
@@ -98,21 +105,21 @@ class PolymarketClient:
             ("batch_cancel_orders", "order_ids"),
         ):
             if hasattr(self.client, method_name):
-                payload = getattr(self.client, method_name)(**{key_name: order_ids})
+                payload = self._call_client(self.client, method_name, **{key_name: order_ids})
                 return {"cancelled": order_ids, "raw": self._to_dict(payload)}
 
         if hasattr(self.client, "cancel_order"):
             raw: list[dict[str, Any]] = []
             for order_id in order_ids:
-                raw.append(self._to_dict(self.client.cancel_order(order_id=order_id)))
+                raw.append(self._to_dict(self._call_client(self.client, "cancel_order", order_id=order_id)))
             return {"cancelled": order_ids, "raw": raw}
 
-        raise RuntimeError("Cancel method not available in current py-clob-client-v2 version.")
+        raise PolymarketApiError("Cancel method not available in current py-clob-client-v2 version.")
 
     def get_order_details(self, order_id: str) -> dict[str, Any] | None:
         for method_name in ("get_order", "get_order_by_id"):
             if hasattr(self.client, method_name):
-                payload = getattr(self.client, method_name)(order_id=order_id)
+                payload = self._call_client(self.client, method_name, order_id=order_id)
                 return self._to_dict(payload)
         return None
 
@@ -124,7 +131,7 @@ class PolymarketClient:
         ]
         for method_name, kwargs in candidates:
             if hasattr(self.client, method_name):
-                payload = getattr(self.client, method_name)(**kwargs)
+                payload = self._call_client(self.client, method_name, **kwargs)
                 return self._extract_balance(payload)
         return None
 
@@ -132,13 +139,13 @@ class PolymarketClient:
         for method_name in ("get_token_balance", "get_balance"):
             if not hasattr(self.client, method_name):
                 continue
-            payload = getattr(self.client, method_name)(token_id=token_id)
+            payload = self._call_client(self.client, method_name, token_id=token_id)
             extracted = self._extract_balance(payload)
             if extracted is not None:
                 return extracted
 
         if hasattr(self.client, "get_positions"):
-            payload = self.client.get_positions()
+            payload = self._call_client(self.client, "get_positions")
             positions = self._extract_list(payload, keys=("positions", "data", "items"))
             for pos in positions:
                 parsed = self._to_dict(pos)
@@ -149,12 +156,22 @@ class PolymarketClient:
 
     def place_limit_order(self, token_id: str, side: str, price: float, size: float) -> dict[str, Any]:
         enum_side = Side.BUY if side.lower() == "buy" else Side.SELL
-        response = self.client.create_and_post_order(
+        response = self._call_client(
+            self.client,
+            "create_and_post_order",
             order_args=OrderArgs(token_id=token_id, price=price, side=enum_side, size=size),
             options=PartialCreateOrderOptions(tick_size=self.settings.tick_size),
             order_type=OrderType.GTC,
         )
         return self._to_dict(response)
+
+    def _call_client(self, target: Any, method_name: str, **kwargs: Any) -> Any:
+        try:
+            method = getattr(target, method_name)
+            return method(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Falha na chamada CLOB", extra={"method": method_name, "params": kwargs})
+            raise PolymarketApiError(f"CLOB call failed: {method_name}") from exc
 
     @staticmethod
     def _extract_list(payload: Any, keys: tuple[str, ...]) -> list[Any]:
@@ -222,7 +239,7 @@ class PolymarketClient:
             if hasattr(payload, attr):
                 return float(getattr(payload, attr))
 
-        raise RuntimeError(f"Unable to parse price payload: {payload}")
+        raise PolymarketApiError(f"Unable to parse price payload: {payload}")
 
     def _mid_from_book(self, book_payload: Any) -> float:
         book = self._to_dict(book_payload)
@@ -230,7 +247,7 @@ class PolymarketClient:
         bids = book.get("bids") or []
         asks = book.get("asks") or []
         if not bids or not asks:
-            raise RuntimeError(f"Order book missing bids/asks: {book}")
+            raise PolymarketApiError(f"Order book missing bids/asks: {book}")
 
         best_bid = self._best_price(bids, side="bid")
         best_ask = self._best_price(asks, side="ask")
@@ -248,6 +265,6 @@ class PolymarketClient:
                 prices.append(float(value))
 
         if not prices:
-            raise RuntimeError("Unable to parse order book levels")
+            raise PolymarketApiError("Unable to parse order book levels")
 
         return max(prices) if side == "bid" else min(prices)

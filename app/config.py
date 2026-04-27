@@ -18,6 +18,10 @@ class Settings:
     tick_size: str
     price_tolerance: float
     min_collateral_buffer: float
+    max_retries: int
+    retry_delay_seconds: float
+    log_level: str
+    log_format: str
     api_key: str | None = None
     api_secret: str | None = None
     api_passphrase: str | None = None
@@ -49,6 +53,10 @@ def load_settings() -> Settings:
             tick_size=os.getenv("TICK_SIZE", "0.01"),
             price_tolerance=float(os.getenv("PRICE_TOLERANCE", "0.0001")),
             min_collateral_buffer=float(os.getenv("MIN_COLLATERAL_BUFFER", "1.0")),
+            max_retries=int(os.getenv("MAX_RETRIES", "3")),
+            retry_delay_seconds=float(os.getenv("RETRY_DELAY_SECONDS", "2")),
+            log_level=os.getenv("LOG_LEVEL", "INFO"),
+            log_format=os.getenv("LOG_FORMAT", "json"),
             api_key=os.getenv("CLOB_API_KEY"),
             api_secret=os.getenv("CLOB_SECRET"),
             api_passphrase=os.getenv("CLOB_PASS_PHRASE"),
