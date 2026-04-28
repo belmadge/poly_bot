@@ -49,6 +49,16 @@ class Settings:
     reposition_price_threshold: float
     # PERFORMANCE: Metrics tracking
     metrics_log_interval_seconds: int
+    # PROMPT 3: Safe hedge controls
+    hedge_min_position_size: float
+    hedge_delay_seconds: float
+    # PROMPT 4: Price sanity checks
+    min_price_bound: float
+    max_price_bound: float
+    max_book_spread_pct: float
+    max_midpoint_deviation_ratio: float
+    # PROMPT 5: Hard sync mode
+    max_sync_age_seconds: float
     api_key: str | None = None
     api_secret: str | None = None
     api_passphrase: str | None = None
@@ -124,6 +134,16 @@ def load_settings() -> Settings:
             reposition_price_threshold=float(os.getenv("REPOSITION_PRICE_THRESHOLD", "0.001")),
             # PERFORMANCE
             metrics_log_interval_seconds=int(os.getenv("METRICS_LOG_INTERVAL_SECONDS", "3600")),
+            # PROMPT 3: Safe hedge controls
+            hedge_min_position_size=float(os.getenv("HEDGE_MIN_POSITION_SIZE", "5.0")),
+            hedge_delay_seconds=float(os.getenv("HEDGE_DELAY_SECONDS", "30.0")),
+            # PROMPT 4: Price sanity checks
+            min_price_bound=float(os.getenv("MIN_PRICE_BOUND", "0.05")),
+            max_price_bound=float(os.getenv("MAX_PRICE_BOUND", "0.95")),
+            max_book_spread_pct=float(os.getenv("MAX_BOOK_SPREAD_PCT", "0.02")),
+            max_midpoint_deviation_ratio=float(os.getenv("MAX_MIDPOINT_DEVIATION_RATIO", "0.25")),
+            # PROMPT 5: Hard sync mode
+            max_sync_age_seconds=float(os.getenv("MAX_SYNC_AGE_SECONDS", "60.0")),
             api_key=os.getenv("CLOB_API_KEY"),
             api_secret=os.getenv("CLOB_SECRET"),
             api_passphrase=os.getenv("CLOB_PASS_PHRASE"),

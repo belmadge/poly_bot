@@ -1,0 +1,12 @@
+{
+  "consecutive_api_errors": 1,
+  "known_orders": {},
+  "last_api_error_time": 1777373525.0568628,
+  "last_api_sync_time": 0.0,
+  "last_hedge_creation_time": {},
+  "last_market_prices": {},
+  "last_metrics_log_time": 0.0,
+  "net_positions": {},
+  "total_pnl_realized": 0.0,
+  "trades_executed": 0
+}

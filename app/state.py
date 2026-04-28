@@ -17,6 +17,10 @@ class BotState:
     last_metrics_log_time: float = 0.0
     consecutive_api_errors: int = 0
     last_api_error_time: float = 0.0
+    # PROMPT 3: Track last hedge creation time per token for throttling
+    last_hedge_creation_time: dict[str, float] = None  # type: ignore
+    # PROMPT 5: Track API sync timestamp
+    last_api_sync_time: float = 0.0
 
 
 class BotStateStore:
@@ -34,6 +38,8 @@ class BotStateStore:
                 last_metrics_log_time=0.0,
                 consecutive_api_errors=0,
                 last_api_error_time=0.0,
+                last_hedge_creation_time={},
+                last_api_sync_time=0.0,
             )
 
         payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -45,6 +51,8 @@ class BotStateStore:
         last_metrics_log_time = payload.get("last_metrics_log_time", 0.0)
         consecutive_api_errors = payload.get("consecutive_api_errors", 0)
         last_api_error_time = payload.get("last_api_error_time", 0.0)
+        last_hedge_creation_time = payload.get("last_hedge_creation_time", {})
+        last_api_sync_time = payload.get("last_api_sync_time", 0.0)
         return BotState(
             known_orders=known_orders,
             net_positions=net_positions,
@@ -54,6 +62,8 @@ class BotStateStore:
             last_metrics_log_time=last_metrics_log_time,
             consecutive_api_errors=consecutive_api_errors,
             last_api_error_time=last_api_error_time,
+            last_hedge_creation_time=last_hedge_creation_time,
+            last_api_sync_time=last_api_sync_time,
         )
 
     def save(self, state: BotState) -> None:
@@ -67,5 +77,7 @@ class BotStateStore:
             "last_metrics_log_time": state.last_metrics_log_time,
             "consecutive_api_errors": state.consecutive_api_errors,
             "last_api_error_time": state.last_api_error_time,
+            "last_hedge_creation_time": state.last_hedge_creation_time or {},
+            "last_api_sync_time": state.last_api_sync_time,
         }
         self.path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,7 +60,13 @@ class MarketMakerBot:
         self.last_api_error_time: float = state.last_api_error_time
         self.consecutive_execution_errors: int = 0
         # Last executed fill timestamp for order synchronization
-        self.last_api_sync_time: float = time.time()
+        self.last_api_sync_time: float = state.last_api_sync_time
+        # Shutdown event for graceful termination (Ctrl+C, kill switch)
+        self.shutdown_event: threading.Event = threading.Event()
+        # PROMPT 3: Track when hedges were last created (for delay throttling)
+        self.last_hedge_creation_time: dict[str, float] = state.last_hedge_creation_time or {}
+        # PROMPT 5: Track API sync timestamp for hard sync mode
+        self.last_api_sync_timestamp: float = state.last_api_sync_time
 
     def run_once(self) -> None:
         # HARDENING: Synchronize with API - ensure API is source of truth
@@ -163,6 +170,7 @@ class MarketMakerBot:
             # Check kill switch
             if self._check_kill_switch():
                 logger.critical("KILL SWITCH ACTIVATED. Shutting down bot.", extra={"event": "kill_switch"})
+                self.shutdown_event.set()
                 break
             
             logger.info(
@@ -186,6 +194,7 @@ class MarketMakerBot:
                 )
             except KeyboardInterrupt:
                 logger.info("Bot interrompido pelo usuario.", extra={"event": "shutdown"})
+                self.shutdown_event.set()  # Signal shutdown to skip sleep in finally
                 break
             except PolymarketApiError as exc:
                 self.consecutive_api_errors += 1
@@ -212,6 +221,7 @@ class MarketMakerBot:
                         },
                     )
                     self._save_state()
+                    self.shutdown_event.set()
                     break
             except Exception as exc:  # noqa: BLE001
                 self.consecutive_execution_errors += 1
@@ -238,6 +248,7 @@ class MarketMakerBot:
                         },
                     )
                     self._save_state()
+                    self.shutdown_event.set()
                     break
             finally:
                 self._save_state()
@@ -248,7 +259,9 @@ class MarketMakerBot:
                         "sleep_seconds": self.settings.loop_interval_seconds,
                     },
                 )
-                time.sleep(self.settings.loop_interval_seconds)
+                # Only sleep if not shutting down - allows immediate Ctrl+C exit
+                if not self.shutdown_event.is_set():
+                    time.sleep(self.settings.loop_interval_seconds)
 
     def list_open_orders(self, token_id: str | None = None) -> list[dict[str, Any]]:
         target_token_id = token_id or self.current_token_id
@@ -359,6 +372,14 @@ class MarketMakerBot:
     def _build_quote_context(self) -> QuoteContext:
         market = self._select_market()
         self.current_token_id = market["token_id"]
+        
+        # PROMPT 4: Validate price is within safe bounds and spread is normal
+        if not self._validate_price_sanity(market):
+            raise PolymarketApiError(
+                f"Price sanity check failed for {market['token_id']}: "
+                f"price={market['midpoint']}, spread={market.get('book_spread')}"
+            )
+        
         previous_price = self.last_market_prices.get(market["token_id"])
         price_change_ratio = self._calculate_price_change_ratio(previous_price, market["midpoint"])
         spread = self._determine_spread(market)
@@ -423,6 +444,31 @@ class MarketMakerBot:
             "price": quote.price,
             "size": quote.size,
         }
+
+        if not self._ensure_fresh_sync(token_id):
+            self._log_decision(
+                "sync_check",
+                False,
+                {
+                    **decision_context,
+                    "reason": "Sync da API indisponivel ou stale antes da decisao critica",
+                    "last_sync_timestamp": self.last_api_sync_timestamp,
+                },
+            )
+            return
+
+        open_orders = self.list_open_orders(token_id=token_id)
+
+        if not self._quote_is_complete(quote):
+            self._log_decision(
+                "quote_completeness_check",
+                False,
+                {
+                    **decision_context,
+                    "reason": "Quote incompleta ou invalida",
+                },
+            )
+            return
         
         # Check 1: Duplicate detection
         if self._has_duplicate_open_order(open_orders, quote):
@@ -636,8 +682,8 @@ class MarketMakerBot:
 
     def _build_quotes(self, current_price: float, spread: float) -> dict[str, Quote]:
         half_spread = spread / 2
-        buy_price = max(0.001, round(current_price - half_spread, 4))
-        sell_price = min(0.999, round(current_price + half_spread, 4))
+        buy_price = max(self.settings.min_price_bound, round(current_price - half_spread, 4))
+        sell_price = min(self.settings.max_price_bound, round(current_price + half_spread, 4))
         return {
             "buy": Quote(side="buy", price=buy_price, size=self.settings.size),
             "sell": Quote(side="sell", price=sell_price, size=self.settings.size),
@@ -676,9 +722,18 @@ class MarketMakerBot:
 
     @staticmethod
     def _calculate_price_change_ratio(previous_price: float | None, current_price: float) -> float:
-        if previous_price in {None, 0}:
+        """Calculate the ratio of price change, safely handling edge cases."""
+        # Guard against None or zero previous price
+        if previous_price is None or previous_price == 0.0:
             return 0.0
-        return abs(current_price - previous_price) / abs(previous_price)
+        # Guard against None current price (defensive)
+        if current_price is None:
+            return 0.0
+        # Calculate absolute percentage change
+        try:
+            return abs(current_price - previous_price) / abs(previous_price)
+        except (TypeError, ZeroDivisionError):
+            return 0.0
 
     def _volatility_spread_multiplier(self, price_change_ratio: float) -> float:
         if price_change_ratio >= self.settings.high_volatility_threshold:
@@ -749,10 +804,14 @@ class MarketMakerBot:
                 last_metrics_log_time=self.last_metrics_log_time,
                 consecutive_api_errors=self.consecutive_api_errors,
                 last_api_error_time=self.last_api_error_time,
+                last_hedge_creation_time=self.last_hedge_creation_time,  # PROMPT 3
+                last_api_sync_time=self.last_api_sync_timestamp,  # PROMPT 5
             )
         )
 
     def _check_fills(self) -> list[dict[str, Any]]:
+        if not self._ensure_fresh_sync(self.current_token_id):
+            raise PolymarketApiError("Unable to validate fresh sync before checking fills")
         if not self.known_orders:
             return []
 
@@ -765,67 +824,114 @@ class MarketMakerBot:
                 continue
 
             status = self._extract_status(details)
-            if status in FILLED_STATUSES:
-                token_id = str(snapshot.get("token_id") or self.current_token_id)
-                side = snapshot.get("side") or self._extract_side(details)
-                filled_size = self._extract_size(details) or snapshot.get("size") or 0.0
-                original_size = snapshot.get("size") or filled_size
-                
-                # EXECUTION CONTROL: Detect partial fills
-                is_partial = float(filled_size) < float(original_size)
-                
+            token_id = str(snapshot.get("token_id") or self.current_token_id)
+            side = snapshot.get("side") or self._extract_side(details)
+            original_size = float(snapshot.get("size") or self._extract_size(details) or 0.0)
+            cumulative_filled_size = self._extract_filled_size(details, fallback=original_size if status in FILLED_STATUSES else 0.0)
+            previous_filled_size = float(snapshot.get("filled_size") or 0.0)
+            new_fill_size = round(max(0.0, cumulative_filled_size - previous_filled_size), 4)
+            remaining_size = self._extract_remaining_size(details, original_size, cumulative_filled_size)
+            is_partial = remaining_size > self.settings.price_tolerance
+            has_new_fill = new_fill_size > self.settings.price_tolerance
+
+            if has_new_fill:
                 self._register_fill(
                     token_id=token_id,
                     side=side,
-                    size=float(filled_size),
+                    size=new_fill_size,
                     is_partial=is_partial,
                 )
-                
-                # EXECUTION CONTROL: Ensure hedge position
-                opposite_side = "sell" if side == "buy" else "buy"
-                remaining_size = float(filled_size)
-                
+
                 fill_info = {
                     "order_id": order_id,
                     "token_id": token_id,
                     "side": side,
                     "price": self._extract_price(details) or snapshot.get("price"),
-                    "filled_size": filled_size,
+                    "fill_size": new_fill_size,
+                    "filled_size": cumulative_filled_size,
                     "original_size": original_size,
+                    "remaining_size": remaining_size,
                     "is_partial": is_partial,
                     "status": status,
                     "details": details,
                     "net_position": self._get_net_position(token_id),
                 }
                 filled_orders.append(fill_info)
-                
                 self.trades_executed += 1
                 logger.info(
                     "Ordem executada",
                     extra={
                         "event": "filled",
                         "partial": is_partial,
-                        "remaining_size": remaining_size if is_partial else 0,
                         **fill_info,
                     },
                 )
-            elif status in CLOSED_STATUSES:
+
+                if is_partial:
+                    try:
+                        market = self._with_retry(lambda token_id=token_id: self.client.get_market_snapshot(token_id))
+                        self._create_proportional_hedge_for_partial_fill(
+                            token_id=token_id,
+                            side=side,
+                            filled_size=new_fill_size,
+                            original_size=original_size,
+                            fill_price=float(fill_info["price"] or 0.0),
+                            market=market,
+                        )
+                    except PolymarketApiError as exc:
+                        logger.warning(
+                            "Falha ao avaliar hedge proporcional apos partial fill",
+                            extra={
+                                "event": "partial_fill_hedge_evaluation_failed",
+                                "order_id": order_id,
+                                "token_id": token_id,
+                                "error": str(exc),
+                            },
+                        )
+
+            if status in FILLED_STATUSES or (status in CLOSED_STATUSES and cumulative_filled_size >= original_size - self.settings.price_tolerance):
+                continue
+
+            if status in CLOSED_STATUSES:
                 logger.info(
                     "Ordem encerrada",
-                    extra={"event": "closed", "order_id": order_id, "status": status},
+                    extra={
+                        "event": "closed",
+                        "order_id": order_id,
+                        "status": status,
+                        "filled_size": cumulative_filled_size,
+                        "remaining_size": remaining_size,
+                    },
                 )
             else:
-                still_open[order_id] = {**snapshot, **details}
+                still_open[order_id] = {
+                    **snapshot,
+                    **details,
+                    "status": status,
+                    "size": original_size,
+                    "filled_size": cumulative_filled_size,
+                    "remaining_size": remaining_size,
+                }
 
         self.known_orders = still_open
         self._save_state()
         return filled_orders
 
     def _has_buy_balance(self, quote: Quote) -> bool:
+        """PROMPT 1: Fail-closed balance check - return False if balance cannot be verified."""
+        if not self._quote_is_complete(quote):
+            logger.critical(
+                "FAIL-CLOSED: BUY quote incompleta - bloqueando ordem",
+                extra={"event": "buy_quote_incomplete", "side": quote.side, "price": quote.price, "size": quote.size},
+            )
+            return False
         collateral = self._with_retry(self.client.get_collateral_balance)
         if collateral is None:
-            logger.warning("Nao foi possivel validar collateral; prosseguindo com BUY.", extra={"event": "buy_balance_unknown"})
-            return True
+            logger.critical(
+                "FAIL-CLOSED: Cannot verify collateral for BUY - blocking order",
+                extra={"event": "buy_balance_check_failed"}
+            )
+            return False
 
         required = (quote.price * quote.size) + self.settings.min_collateral_buffer
         logger.info(
@@ -835,10 +941,20 @@ class MarketMakerBot:
         return collateral >= required
 
     def _has_sell_balance(self, quote: Quote) -> bool:
+        """PROMPT 1: Fail-closed balance check - return False if balance cannot be verified."""
+        if not self._quote_is_complete(quote):
+            logger.critical(
+                "FAIL-CLOSED: SELL quote incompleta - bloqueando ordem",
+                extra={"event": "sell_quote_incomplete", "side": quote.side, "price": quote.price, "size": quote.size},
+            )
+            return False
         token_balance = self._with_retry(lambda: self.client.get_token_balance(self.current_token_id))
         if token_balance is None:
-            logger.warning("Nao foi possivel validar posicao do token; prosseguindo com SELL.", extra={"event": "sell_balance_unknown"})
-            return True
+            logger.critical(
+                "FAIL-CLOSED: Cannot verify token position for SELL - blocking order",
+                extra={"event": "sell_balance_check_failed"}
+            )
+            return False
 
         logger.info(
             "Balance check SELL",
@@ -865,11 +981,11 @@ class MarketMakerBot:
             return False
 
         if token_balance is None:
-            logger.warning(
-                "Nao foi possivel validar posicao; prosseguindo com ambos os lados.",
-                extra={"event": "position_unknown"},
+            logger.critical(
+                "FAIL-CLOSED: Nao foi possivel validar posicao; bloqueando decisao de lado.",
+                extra={"event": "position_unknown_blocked", "side": side, "token_id": self.current_token_id},
             )
-            return True
+            return False
 
         lower_bound = max(0.0, self.settings.target_position_size - self.settings.max_position_imbalance)
         upper_bound = self.settings.target_position_size + self.settings.max_position_imbalance
@@ -1031,6 +1147,22 @@ class MarketMakerBot:
         return None
 
     @staticmethod
+    def _extract_filled_size(order: dict[str, Any], fallback: float = 0.0) -> float:
+        for key in ("filled_size", "filled", "matched_size", "executed_size", "size_matched"):
+            value = order.get(key)
+            if value is not None:
+                return float(value)
+        return float(fallback)
+
+    @staticmethod
+    def _extract_remaining_size(order: dict[str, Any], original_size: float, filled_size: float) -> float:
+        for key in ("remaining_size", "remaining", "unfilled_size", "open_size"):
+            value = order.get(key)
+            if value is not None:
+                return max(0.0, float(value))
+        return max(0.0, round(original_size - filled_size, 4))
+
+    @staticmethod
     def _extract_side(order: dict[str, Any]) -> str:
         value = order.get("side")
         if value is None:
@@ -1055,11 +1187,15 @@ class MarketMakerBot:
                 self.known_orders[order_id] = self._build_order_snapshot(order)
 
     def _build_order_snapshot(self, order: dict[str, Any]) -> dict[str, Any]:
+        original_size = self._extract_size(order)
+        filled_size = self._extract_filled_size(order)
         return {
             "token_id": str(order.get("token_id") or order.get("market") or self.current_token_id),
             "side": self._extract_side(order),
             "price": self._extract_price(order),
-            "size": self._extract_size(order),
+            "size": original_size,
+            "filled_size": filled_size,
+            "remaining_size": self._extract_remaining_size(order, float(original_size or 0.0), float(filled_size or 0.0)),
             "status": self._extract_status(order),
             "raw": order,
         }
@@ -1072,14 +1208,21 @@ class MarketMakerBot:
         Returns False if critical inconsistency detected.
         """
         try:
-            api_orders = self._with_retry(
-                lambda: self.client.get_open_orders(self.current_token_id)
-            )
-            api_order_ids = {
-                self.client.extract_order_id(order)
-                for order in api_orders
-                if self.client.extract_order_id(order)
-            }
+            api_orders: list[dict[str, Any]] = []
+            for token_id in self._relevant_token_ids():
+                api_orders.extend(
+                    self._with_retry(lambda token_id=token_id: self.client.get_open_orders(token_id))
+                )
+            
+            # Build a map of order_id -> order for efficient lookup
+            api_order_map: dict[str, dict[str, Any]] = {}
+            api_order_ids: set[str] = set()
+            
+            for order in api_orders:
+                order_id = self.client.extract_order_id(order)
+                if order_id:
+                    api_order_map[order_id] = order
+                    api_order_ids.add(order_id)
             
             local_order_ids = set(self.known_orders.keys())
             
@@ -1106,10 +1249,10 @@ class MarketMakerBot:
                     },
                 )
                 # Import these orders into known_orders
-                for order in api_orders:
-                    order_id = self.client.extract_order_id(order)
-                    if order_id in unknown_orders:
-                        self.known_orders[order_id] = self._build_order_snapshot(order)
+                for order_id in unknown_orders:
+                    api_order = api_order_map.get(order_id)
+                    if api_order:
+                        self.known_orders[order_id] = self._build_order_snapshot(api_order)
                         logger.info(
                             "Ordem desconhecida importada para estado local",
                             extra={
@@ -1119,10 +1262,7 @@ class MarketMakerBot:
                         )
             
             # Detailed price validation
-            for order_id, api_order in zip(
-                [self.client.extract_order_id(o) for o in api_orders],
-                api_orders,
-            ):
+            for order_id, api_order in api_order_map.items():
                 if order_id not in self.known_orders:
                     continue
                     
@@ -1170,6 +1310,13 @@ class MarketMakerBot:
         POSITION SAFETY: Ensure all positions have opposite hedges.
         If unhedged position detected for too long, create hedge automatically.
         """
+        if not self._ensure_fresh_sync(self.current_token_id):
+            logger.critical(
+                "FAIL-SAFE: Sync stale durante validacao de hedge",
+                extra={"event": "hedge_validation_sync_failed", "token_id": self.current_token_id},
+            )
+            return False
+
         unhedged_positions: dict[str, tuple[str, float]] = {}
         
         for token_id, net_position in self.net_positions.items():
@@ -1178,45 +1325,35 @@ class MarketMakerBot:
             
             # Position is long (positive) - need SELL hedge
             if net_position > 0:
-                has_sell_order = any(
-                    self._extract_side(order) == "sell"
-                    for order in [
-                        self.known_orders[oid]["raw"]
-                        for oid in self.known_orders
-                        if self.known_orders[oid].get("token_id") == token_id
-                    ]
-                    if "raw" in self.known_orders.get(oid, {})
-                )
-                if not has_sell_order:
-                    unhedged_positions[token_id] = ("sell", net_position)
+                existing_sell_hedge = self._open_order_size_for_side(token_id, "sell")
+                missing_hedge = max(0.0, round(net_position - existing_sell_hedge, 4))
+                if missing_hedge > self.settings.price_tolerance:
+                    unhedged_positions[token_id] = ("sell", missing_hedge)
                     logger.warning(
                         "POSITION SAFETY: Posicao LONG sem hedge SELL",
                         extra={
                             "event": "unhedged_position_long",
                             "token_id": token_id,
                             "position_size": net_position,
+                            "existing_hedge_size": existing_sell_hedge,
+                            "missing_hedge_size": missing_hedge,
                         },
                     )
             
             # Position is short (negative) - need BUY hedge
             elif net_position < 0:
-                has_buy_order = any(
-                    self._extract_side(order) == "buy"
-                    for order in [
-                        self.known_orders[oid]["raw"]
-                        for oid in self.known_orders
-                        if self.known_orders[oid].get("token_id") == token_id
-                    ]
-                    if "raw" in self.known_orders.get(oid, {})
-                )
-                if not has_buy_order:
-                    unhedged_positions[token_id] = ("buy", abs(net_position))
+                existing_buy_hedge = self._open_order_size_for_side(token_id, "buy")
+                missing_hedge = max(0.0, round(abs(net_position) - existing_buy_hedge, 4))
+                if missing_hedge > self.settings.price_tolerance:
+                    unhedged_positions[token_id] = ("buy", missing_hedge)
                     logger.warning(
                         "POSITION SAFETY: Posicao SHORT sem hedge BUY",
                         extra={
                             "event": "unhedged_position_short",
                             "token_id": token_id,
                             "position_size": net_position,
+                            "existing_hedge_size": existing_buy_hedge,
+                            "missing_hedge_size": missing_hedge,
                         },
                     )
         
@@ -1233,40 +1370,19 @@ class MarketMakerBot:
         )
         
         for token_id, (hedge_side, hedge_size) in unhedged_positions.items():
+            if not self._should_create_hedge(token_id, hedge_size, time.time()):
+                continue
+
             try:
-                # Get current price for hedge placement
-                market = self._with_retry(
-                    lambda token_id=token_id: self.client.get_market_snapshot(token_id)
-                )
-                base_price = market["midpoint"]
-                
-                # Place hedge order slightly worse (more conservative)
-                if hedge_side == "buy":
-                    hedge_price = max(0.001, base_price - 0.01)  # 1 cent worse for buy
-                else:
-                    hedge_price = min(0.999, base_price + 0.01)  # 1 cent worse for sell
-                
-                response = self._with_retry(
-                    lambda: self.client.place_limit_order(
-                        token_id=token_id,
-                        side=hedge_side,
-                        price=round(hedge_price, 4),
-                        size=round(hedge_size, 4),
+                market = self._with_retry(lambda token_id=token_id: self.client.get_market_snapshot(token_id))
+                if not self._validate_price_sanity(market):
+                    logger.warning(
+                        "Hedge automatico bloqueado por sanity check de preco",
+                        extra={"event": "auto_hedge_price_sanity_blocked", "token_id": token_id},
                     )
-                )
-                
-                self._track_order_id(response)
-                logger.info(
-                    "POSITION SAFETY: Hedge criado automaticamente",
-                    extra={
-                        "event": "auto_hedge_success",
-                        "token_id": token_id,
-                        "hedge_side": hedge_side,
-                        "hedge_size": hedge_size,
-                        "hedge_price": hedge_price,
-                        "order_id": self.client.extract_order_id(response),
-                    },
-                )
+                    continue
+                if not self._create_conservative_hedge(token_id, hedge_side, hedge_size, market):
+                    return False
             except PolymarketApiError as exc:
                 logger.exception(
                     "FAIL-SAFE: Falha ao criar hedge automatico",
@@ -1297,12 +1413,27 @@ class MarketMakerBot:
                 "token_id": context.token_id,
                 "plan_buy_price": execution_plan.buy.price,
                 "plan_sell_price": execution_plan.sell.price,
+                "last_sync_timestamp": self.last_api_sync_timestamp,
             },
         )
+
+        if not self._quote_is_complete(execution_plan.buy) or not self._quote_is_complete(execution_plan.sell):
+            logger.critical(
+                "FAIL-CLOSED: Quote incompleta no plano de execucao",
+                extra={
+                    "event": "pre_order_incomplete_execution_plan",
+                    "buy_price": execution_plan.buy.price,
+                    "buy_size": execution_plan.buy.size,
+                    "sell_price": execution_plan.sell.price,
+                    "sell_size": execution_plan.sell.size,
+                },
+            )
+            return False
         
         # 1. Sync with API
         try:
             self._sync_orders_with_api()
+            self.last_api_sync_timestamp = time.time()  # PROMPT 5: Track sync timestamp
             logger.info(
                 "PRE-ORDER: Sincronizacao com API completa",
                 extra={
@@ -1317,6 +1448,14 @@ class MarketMakerBot:
                     "event": "pre_order_api_sync_failed",
                     "error": str(exc),
                 },
+            )
+            return False
+        
+        # PROMPT 5: Ensure sync is fresh before proceeding
+        if not self._ensure_fresh_sync(context.token_id):
+            logger.critical(
+                "PRE-ORDER: Sync validation failed - blocking orders",
+                extra={"event": "pre_order_sync_validation_failed"},
             )
             return False
         
@@ -1346,35 +1485,43 @@ class MarketMakerBot:
             extra={"event": "pre_order_hedges_ok"},
         )
         
-        # 4. Confirm balance
+        # 4. Confirm balance - FAIL-CLOSED: Must not proceed without balance info
         collateral = self._with_retry(self.client.get_collateral_balance)
         token_balance = self._get_token_balance()
         
         if collateral is None or token_balance is None:
-            logger.warning(
-                "PRE-ORDER: Nao foi possivel confirmar balance - prosseguindo com cautela",
+            logger.critical(
+                "FAIL-CLOSED: Unable to confirm balance - blocking order placement",
                 extra={
-                    "event": "pre_order_balance_unknown",
+                    "event": "pre_order_balance_check_failed",
                     "collateral": collateral,
                     "token_balance": token_balance,
                 },
             )
-        else:
-            required_buy = (execution_plan.buy.price * execution_plan.buy.size) + self.settings.min_collateral_buffer
-            required_sell = execution_plan.sell.size
-            
-            logger.info(
-                "PRE-ORDER: Balance confirmado",
-                extra={
-                    "event": "pre_order_balance_confirmed",
-                    "collateral": collateral,
-                    "required_for_buy": required_buy,
-                    "token_balance": token_balance,
-                    "required_for_sell": required_sell,
-                    "buy_feasible": collateral >= required_buy,
-                    "sell_feasible": token_balance >= required_sell,
-                },
+            return False
+        
+        required_buy = (execution_plan.buy.price * execution_plan.buy.size) + self.settings.min_collateral_buffer
+        required_sell = execution_plan.sell.size
+        
+        logger.info(
+            "PRE-ORDER: Balance confirmado",
+            extra={
+                "event": "pre_order_balance_confirmed",
+                "collateral": collateral,
+                "required_for_buy": required_buy,
+                "token_balance": token_balance,
+                "required_for_sell": required_sell,
+                "buy_feasible": collateral >= required_buy,
+                "sell_feasible": token_balance >= required_sell,
+            },
+        )
+
+        if not self._has_buy_balance(execution_plan.buy) and not self._has_sell_balance(execution_plan.sell):
+            logger.critical(
+                "FAIL-CLOSED: Nenhum lado possui saldo validado para criacao de ordem",
+                extra={"event": "pre_order_no_valid_side", "token_id": context.token_id},
             )
+            return False
         
         logger.info(
             "PRE-ORDER: Todas as validacoes completas - pronto para criar ordens",
@@ -1382,6 +1529,21 @@ class MarketMakerBot:
         )
         
         return True
+
+    # ========== KILL SWITCH: Check if bot should stop ==========
+    def _check_kill_switch(self) -> bool:
+        """
+        Check if kill switch should be activated by reading flag file.
+        Returns True if flag file exists (kill switch activated), False otherwise.
+        """
+        flag_file_path = Path(self.settings.kill_switch_flag_file)
+        if flag_file_path.exists():
+            logger.critical(
+                "KILL SWITCH: Flag file detected",
+                extra={"event": "kill_switch_flag_file", "path": str(flag_file_path)},
+            )
+            return True
+        return False
 
     # ========== DECISION LOGGING: Log all critical decisions ==========
     def _log_decision(self, decision_type: str, decision: bool, details: dict[str, Any]) -> None:
@@ -1397,23 +1559,16 @@ class MarketMakerBot:
                 **details,
             },
         )
-        """Check if kill switch should be activated."""
-        # Check manual kill switch flag file
-        flag_file_path = Path(self.settings.kill_switch_flag_file)
-        if flag_file_path.exists():
-            logger.critical(
-                "KILL SWITCH: Flag file detected",
-                extra={"event": "kill_switch_flag_file", "path": str(flag_file_path)},
-            )
-            return True
-        return False
 
     def _check_balance_safety(self) -> bool:
-        """Check if balance is above minimum threshold."""
+        """Check if balance is above minimum threshold. FAIL-CLOSED: Returns False if check fails."""
         collateral = self._with_retry(self.client.get_collateral_balance)
         if collateral is None:
-            logger.warning("Unable to check balance safety", extra={"event": "balance_check_failed"})
-            return True
+            logger.critical(
+                "FAIL-CLOSED: Unable to check balance - blocking cycle", 
+                extra={"event": "balance_check_failed"}
+            )
+            return False
         
         is_safe = collateral >= self.settings.min_balance_threshold
         if not is_safe:
@@ -1435,9 +1590,11 @@ class MarketMakerBot:
         This ensures API is the source of truth.
         """
         try:
-            api_open_orders = self._with_retry(
-                lambda: self.client.get_open_orders(self.current_token_id)
-            )
+            api_open_orders: list[dict[str, Any]] = []
+            for token_id in self._relevant_token_ids():
+                api_open_orders.extend(
+                    self._with_retry(lambda token_id=token_id: self.client.get_open_orders(token_id))
+                )
             api_order_ids = {
                 self.client.extract_order_id(order)
                 for order in api_open_orders
@@ -1465,6 +1622,7 @@ class MarketMakerBot:
                     self.known_orders[order_id] = self._build_order_snapshot(order)
             
             self.last_api_sync_time = time.time()
+            self.last_api_sync_timestamp = self.last_api_sync_time
             logger.info(
                 "API sync completo",
                 extra={
@@ -1472,6 +1630,7 @@ class MarketMakerBot:
                     "api_orders": len(api_order_ids),
                     "local_orders": len(self.known_orders),
                     "stale_removed": len(stale_order_ids),
+                    "sync_timestamp": self.last_api_sync_timestamp,
                 },
             )
         except PolymarketApiError as exc:
@@ -1586,6 +1745,353 @@ class MarketMakerBot:
             },
         )
         return False
+
+    # ========== PROMPT 4: PRICE SANITY CHECK ==========
+    def _validate_price_sanity(self, market: dict[str, Any]) -> bool:
+        """
+        PROMPT 4: Block operations if price is outside safe bounds or spread is abnormal.
+        - Reject prices < min_price_bound (default 0.05) or > max_price_bound (default 0.95)
+        - Reject if book_spread is abnormally large
+        """
+        price = float(market["midpoint"])
+        token_id = str(market["token_id"])
+        book_spread = market.get("book_spread")
+
+        if price < self.settings.min_price_bound or price > self.settings.max_price_bound:
+            logger.critical(
+                "PROMPT 4: Price outside safe bounds - blocking operations",
+                extra={
+                    "event": "price_sanity_check_failed",
+                    "token_id": token_id,
+                    "price": price,
+                    "min_bound": self.settings.min_price_bound,
+                    "max_bound": self.settings.max_price_bound,
+                },
+            )
+            return False
+        
+        # Check if book spread is abnormally large
+        if book_spread is not None:
+            max_normal_spread = price * self.settings.max_book_spread_pct
+            if book_spread > max_normal_spread:
+                logger.critical(
+                    "PROMPT 4: Book spread abnormally large - blocking operations",
+                    extra={
+                        "event": "spread_sanity_check_failed",
+                        "token_id": token_id,
+                        "price": price,
+                        "book_spread": book_spread,
+                        "max_normal_spread": max_normal_spread,
+                        "spread_pct": (book_spread / price) if price > 0 else 0,
+                    },
+                )
+                return False
+
+        previous_price = self.last_market_prices.get(token_id)
+        if previous_price not in {None, 0}:
+            midpoint_change_ratio = self._calculate_price_change_ratio(previous_price, price)
+            if midpoint_change_ratio > self.settings.max_midpoint_deviation_ratio:
+                logger.critical(
+                    "PROMPT 4: Midpoint outlier detected - blocking operations",
+                    extra={
+                        "event": "midpoint_outlier_detected",
+                        "token_id": token_id,
+                        "price": price,
+                        "previous_price": previous_price,
+                        "change_ratio": round(midpoint_change_ratio, 6),
+                        "max_ratio": self.settings.max_midpoint_deviation_ratio,
+                    },
+                )
+                return False
+        
+        return True
+
+    # ========== PROMPT 3: SAFE HEDGE ==========
+    def _should_create_hedge(self, token_id: str, net_position: float, current_time: float) -> bool:
+        """
+        PROMPT 3: Determine if hedge should be created based on position size and timing.
+        - Only hedge if position > hedge_min_position_size
+        - Respect hedge_delay_seconds between hedge attempts
+        """
+        # Check if position is large enough to warrant hedging
+        if abs(net_position) < self.settings.hedge_min_position_size:
+            logger.debug(
+                "PROMPT 3: Position too small to hedge",
+                extra={
+                    "event": "hedge_skipped_too_small",
+                    "token_id": token_id,
+                    "position_size": abs(net_position),
+                    "min_size": self.settings.hedge_min_position_size,
+                },
+            )
+            return False
+        
+        # Check if enough time has passed since last hedge attempt
+        last_hedge_time = self.last_hedge_creation_time.get(token_id, 0.0)
+        time_since_last_hedge = current_time - last_hedge_time
+        
+        if time_since_last_hedge < self.settings.hedge_delay_seconds:
+            logger.debug(
+                "PROMPT 3: Hedge delay not elapsed",
+                extra={
+                    "event": "hedge_skipped_cooldown",
+                    "token_id": token_id,
+                    "time_since_last_hedge": round(time_since_last_hedge, 1),
+                    "hedge_delay": self.settings.hedge_delay_seconds,
+                },
+            )
+            return False
+        
+        return True
+
+    def _create_conservative_hedge(
+        self,
+        token_id: str,
+        hedge_side: str,
+        hedge_size: float,
+        market: dict[str, Any],
+    ) -> bool:
+        """
+        PROMPT 3: Create hedge using more conservative pricing based on current spread.
+        Place hedge at worse price than midpoint to increase fill probability.
+        """
+        base_price = float(market["midpoint"])
+        best_bid = float(market.get("best_bid") or max(self.settings.min_price_bound, base_price - float(market.get("book_spread", 0.0)) / 2))
+        best_ask = float(market.get("best_ask") or min(self.settings.max_price_bound, base_price + float(market.get("book_spread", 0.0)) / 2))
+        book_spread = float(market.get("book_spread", max(0.0, best_ask - best_bid)))
+
+        if hedge_size <= self.settings.price_tolerance:
+            logger.info(
+                "PROMPT 3: Hedge size below tolerance - skipping",
+                extra={"event": "hedge_skipped_tolerance", "token_id": token_id, "hedge_size": hedge_size},
+            )
+            return False
+        
+        # Hedge uses executable side of the spread to reduce directional risk quickly.
+        if hedge_side == "buy":
+            hedge_price = max(
+                self.settings.min_price_bound,
+                round(min(self.settings.max_price_bound, best_ask), 4),
+            )
+        else:
+            hedge_price = min(
+                self.settings.max_price_bound,
+                round(max(self.settings.min_price_bound, best_bid), 4),
+            )
+        
+        try:
+            response = self._with_retry(
+                lambda: self.client.place_limit_order(
+                    token_id=token_id,
+                    side=hedge_side,
+                    price=hedge_price,
+                    size=round(hedge_size, 4),
+                )
+            )
+            
+            self._track_order_id(response)
+            self.last_hedge_creation_time[token_id] = time.time()
+            
+            logger.info(
+                "PROMPT 3: Conservative hedge created",
+                extra={
+                    "event": "hedge_created_conservative",
+                    "token_id": token_id,
+                    "hedge_side": hedge_side,
+                    "hedge_size": hedge_size,
+                    "midpoint": base_price,
+                    "hedge_price": hedge_price,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "book_spread": book_spread,
+                    "order_id": self.client.extract_order_id(response),
+                },
+            )
+            return True
+        except PolymarketApiError as exc:
+            logger.exception(
+                "PROMPT 3: Failed to create conservative hedge",
+                extra={
+                    "event": "hedge_failed",
+                    "token_id": token_id,
+                    "error": str(exc),
+                },
+            )
+            return False
+
+    # ========== PROMPT 2: PROPORTIONAL HEDGE FOR PARTIAL FILLS ==========
+    def _create_proportional_hedge_for_partial_fill(
+        self,
+        token_id: str,
+        side: str,
+        filled_size: float,
+        original_size: float,
+        fill_price: float,
+        market: dict[str, Any],
+    ) -> None:
+        """
+        PROMPT 2: For partial fills, create proportional hedge.
+        If only part of order filled, create hedge for just the filled portion.
+        """
+        fill_ratio = filled_size / original_size if original_size > 0 else 0
+        
+        logger.info(
+            "PROMPT 2: Partial fill detected - analyzing hedge requirement",
+            extra={
+                "event": "partial_fill_analysis",
+                "token_id": token_id,
+                "side": side,
+                "filled_size": filled_size,
+                "original_size": original_size,
+                "fill_ratio": round(fill_ratio, 4),
+                "fill_price": fill_price,
+            },
+        )
+        
+        # Only hedge if position becomes significant after partial fill
+        current_net_position = self._get_net_position(token_id)
+        if abs(current_net_position) < self.settings.hedge_min_position_size:
+            logger.info(
+                "PROMPT 2: Partial fill position too small for hedge",
+                extra={
+                    "event": "partial_fill_hedge_skipped_too_small",
+                    "token_id": token_id,
+                    "net_position": current_net_position,
+                    "min_hedge_size": self.settings.hedge_min_position_size,
+                },
+            )
+            return
+        
+        # Determine hedge requirements
+        if side == "buy":
+            remaining_size = original_size - filled_size
+            logger.info(
+                "PROMPT 2: BUY partial fill with remaining unfilled",
+                extra={
+                    "event": "partial_fill_buy",
+                    "token_id": token_id,
+                    "filled": filled_size,
+                    "remaining": remaining_size,
+                    "fill_price": fill_price,
+                },
+            )
+        else:  # SELL
+            remaining_size = original_size - filled_size
+            logger.info(
+                "PROMPT 2: SELL partial fill with remaining unfilled",
+                extra={
+                    "event": "partial_fill_sell",
+                    "token_id": token_id,
+                    "filled": filled_size,
+                    "remaining": remaining_size,
+                    "fill_price": fill_price,
+                },
+            )
+
+        hedge_side = "sell" if current_net_position > 0 else "buy"
+        existing_hedge_size = self._open_order_size_for_side(token_id, hedge_side)
+        required_hedge_size = max(0.0, round(abs(current_net_position) - existing_hedge_size, 4))
+
+        if required_hedge_size <= self.settings.price_tolerance:
+            logger.info(
+                "PROMPT 2: Hedge proporcional nao necessario",
+                extra={
+                    "event": "partial_fill_hedge_not_needed",
+                    "token_id": token_id,
+                    "hedge_side": hedge_side,
+                    "existing_hedge_size": existing_hedge_size,
+                    "required_hedge_size": required_hedge_size,
+                },
+            )
+            return
+
+        if not self._should_create_hedge(token_id, required_hedge_size, time.time()):
+            return
+
+        if not self._validate_price_sanity(market):
+            logger.warning(
+                "PROMPT 2: Hedge proporcional bloqueado por sanity check",
+                extra={"event": "partial_fill_hedge_price_sanity_blocked", "token_id": token_id},
+            )
+            return
+
+        self._create_conservative_hedge(
+            token_id=token_id,
+            hedge_side=hedge_side,
+            hedge_size=required_hedge_size,
+            market=market,
+        )
+
+    # ========== PROMPT 5: HARD SYNC MODE ==========
+    def _ensure_fresh_sync(self, token_id: str, max_age: float | None = None) -> bool:
+        """
+        PROMPT 5: Before critical decisions, ensure API sync is fresh.
+        Block operations if sync is too old.
+        """
+        if max_age is None:
+            max_age = self.settings.max_sync_age_seconds
+        
+        current_time = time.time()
+        sync_age = current_time - self.last_api_sync_timestamp
+        
+        if sync_age > max_age:
+            logger.warning(
+                "PROMPT 5: API sync stale - forcing refresh",
+                extra={
+                    "event": "sync_stale_forcing_refresh",
+                    "token_id": token_id,
+                    "sync_age": round(sync_age, 1),
+                    "max_age": max_age,
+                },
+            )
+            
+            # Force immediate sync
+            try:
+                self._sync_orders_with_api()
+                self.last_api_sync_timestamp = time.time()
+                logger.info(
+                    "PROMPT 5: Fresh sync completed",
+                    extra={
+                        "event": "sync_refreshed",
+                        "token_id": token_id,
+                        "open_orders": len(self.known_orders),
+                    },
+                )
+                return True
+            except PolymarketApiError as exc:
+                logger.critical(
+                    "PROMPT 5: Failed to refresh sync - blocking operations",
+                    extra={
+                        "event": "sync_refresh_failed",
+                        "token_id": token_id,
+                        "error": str(exc),
+                    },
+                )
+                return False
+        
+        return True
+
+    @staticmethod
+    def _quote_is_complete(quote: Quote) -> bool:
+        return (
+            quote.side in {"buy", "sell"}
+            and quote.price is not None
+            and quote.size is not None
+            and quote.price > 0
+            and quote.size > 0
+        )
+
+    def _open_order_size_for_side(self, token_id: str, side: str) -> float:
+        total = 0.0
+        for snapshot in self.known_orders.values():
+            if snapshot.get("token_id") != token_id:
+                continue
+            if snapshot.get("side") != side:
+                continue
+            size = float(snapshot.get("size") or 0.0)
+            filled_size = float(snapshot.get("filled_size") or 0.0)
+            total += max(0.0, size - filled_size)
+        return round(total, 4)
 
     # ========== PERFORMANCE METRICS LOGGING ==========
     def _log_performance_metrics(self) -> None:
