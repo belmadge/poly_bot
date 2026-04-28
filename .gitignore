@@ -1,11 +1,13 @@
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
 # Local environment
 .env
 .env.*
 !.env.example
+bot_state.json
 
 # Virtual envs
 .venv/
