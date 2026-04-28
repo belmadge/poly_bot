@@ -61,6 +61,7 @@ def settings(temp_state_file, kill_switch_path):
         max_book_spread_pct=0.02,
         max_midpoint_deviation_ratio=0.25,
         max_sync_age_seconds=60.0,
+        dry_run=False,
     )
 
 
@@ -177,6 +178,18 @@ class TestOrderFlow:
         assert mock_client.place_limit_order.call_count == 2
         assert sync_mock.call_count == 2
 
+    def test_dry_run_skips_order_placement(self, settings, mock_client):
+        dry_settings = replace(settings, dry_run=True)
+        bot = MarketMakerBot(dry_settings, mock_client)
+        bot._place_order(Quote("buy", 0.49, 10.0))
+        assert mock_client.place_limit_order.call_count == 0
+
+    def test_dry_run_skips_cancellation(self, settings, mock_client):
+        dry_settings = replace(settings, dry_run=True)
+        bot = MarketMakerBot(dry_settings, mock_client)
+        bot.cancel_open_orders([{"order_id": "buy-1", "side": "buy", "price": 0.49, "size": 10.0, "status": "open"}])
+        assert mock_client.cancel_orders.call_count == 0
+
 
 class TestRunLoop:
     def test_shutdown_event_initialized(self, settings, mock_client):
@@ -198,4 +211,9 @@ class TestRunLoop:
         with patch.object(bot, "run_once", side_effect=PolymarketApiError("boom")):
             with patch("time.sleep"):
                 bot.run_forever()
+        assert bot.shutdown_event.is_set()
+
+    def test_request_shutdown_sets_event(self, settings, mock_client):
+        bot = MarketMakerBot(settings, mock_client)
+        bot.request_shutdown("sigterm")
         assert bot.shutdown_event.is_set()

@@ -11,6 +11,7 @@ Versao enxuta para producao com menos pontos de falha:
 - API sempre como source of truth
 - validacoes fail-closed
 - cancelamento e recriacao de ordens apenas quando necessario
+- `DRY_RUN` para teste seco sem enviar ou cancelar ordens
 
 ## Fluxo
 
@@ -69,7 +70,7 @@ copy .env.example .env
 - Saldo e risco: `MIN_COLLATERAL_BUFFER`, `MAX_BALANCE_USAGE_PCT`, `MIN_BALANCE_THRESHOLD`
 - Validacao de mercado: `MIN_PRICE_BOUND`, `MAX_PRICE_BOUND`, `MAX_BOOK_SPREAD_PCT`, `MAX_MIDPOINT_DEVIATION_RATIO`
 - Resiliencia: `MAX_RETRIES`, `RETRY_DELAY_SECONDS`, `MAX_API_FAILURE_STREAK`, `MAX_CONSECUTIVE_ERRORS`, `MAX_SYNC_AGE_SECONDS`
-- Operacao: `STATE_FILE`, `KILL_SWITCH_FLAG_FILE`, `LOG_LEVEL`, `LOG_FORMAT`
+- Operacao: `STATE_FILE`, `KILL_SWITCH_FLAG_FILE`, `LOG_LEVEL`, `LOG_FORMAT`, `DRY_RUN`
 
 ## Execucao
 
@@ -86,3 +87,7 @@ python -m pytest -q
 ## Kill switch
 
 Se o arquivo configurado em `KILL_SWITCH_FLAG_FILE` existir, o bot encerra o loop.
+
+## Dry run
+
+Com `DRY_RUN=true`, o bot continua lendo book, saldo e ordens, mas nao envia novas ordens nem cancela ordens existentes.

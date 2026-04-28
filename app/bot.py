@@ -35,6 +35,13 @@ class MarketMakerBot:
         self.consecutive_execution_errors: int = 0
         self.shutdown_event = threading.Event()
 
+    def request_shutdown(self, reason: str = "external_signal") -> None:
+        logger.info(
+            "Shutdown requested",
+            extra={"event": "shutdown_requested", "token_id": self.settings.token_id, "reason": reason},
+        )
+        self.shutdown_event.set()
+
     def run_forever(self) -> None:
         logger.info(
             "Starting market maker bot",
@@ -117,7 +124,7 @@ class MarketMakerBot:
     def list_open_orders(self) -> list[dict[str, Any]]:
         orders = self._with_retry(lambda: self.client.get_open_orders(self.settings.token_id))
         self.known_orders = self._snapshots_by_id(orders)
-        logger.info(
+        logger.debug(
             "Open orders loaded from API",
             extra={"event": "open_orders", "token_id": self.settings.token_id, "count": len(orders)},
         )
@@ -133,6 +140,12 @@ class MarketMakerBot:
             "Cancelling existing orders",
             extra={"event": "cancel_start", "token_id": self.settings.token_id, "count": len(order_ids)},
         )
+        if self.settings.dry_run:
+            logger.warning(
+                "DRY_RUN enabled, skipping cancellation",
+                extra={"event": "dry_run_cancel_skip", "token_id": self.settings.token_id, "count": len(order_ids)},
+            )
+            return
         self._with_retry(lambda: self.client.cancel_orders(order_ids))
         self._sync_orders_with_api()
         logger.info(
@@ -159,7 +172,7 @@ class MarketMakerBot:
         orders = self._with_retry(lambda: self.client.get_open_orders(self.settings.token_id))
         self.known_orders = self._snapshots_by_id(orders)
         self.last_api_sync_time = time.time()
-        logger.info(
+        logger.debug(
             "API sync complete",
             extra={"event": "api_sync_complete", "token_id": self.settings.token_id, "count": len(self.known_orders), "sync_timestamp": self.last_api_sync_time},
         )
@@ -303,7 +316,7 @@ class MarketMakerBot:
         for side in ("buy", "sell"):
             quote = quotes[side]
             if self._has_matching_order(open_orders, quote):
-                logger.info(
+                logger.debug(
                     "Matching order already exists",
                     extra={"event": "place_skip_existing", "token_id": self.settings.token_id, "side": side, "price": quote.price},
                 )
@@ -335,6 +348,18 @@ class MarketMakerBot:
     def _place_order(self, quote: Quote) -> None:
         if not self._quote_is_complete(quote):
             raise PolymarketApiError("Attempted to place incomplete quote")
+        if self.settings.dry_run:
+            logger.warning(
+                "DRY_RUN enabled, order not sent",
+                extra={
+                    "event": "dry_run_place_order",
+                    "token_id": self.settings.token_id,
+                    "side": quote.side,
+                    "price": quote.price,
+                    "size": quote.size,
+                },
+            )
+            return
         response = self._with_retry(
             lambda: self.client.place_limit_order(
                 token_id=self.settings.token_id,

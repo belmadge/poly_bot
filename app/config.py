@@ -34,6 +34,7 @@ class Settings:
     max_book_spread_pct: float
     max_midpoint_deviation_ratio: float
     max_sync_age_seconds: float
+    dry_run: bool
     api_key: str | None = None
     api_secret: str | None = None
     api_passphrase: str | None = None
@@ -48,6 +49,13 @@ def _required(name: str) -> str:
     if not value:
         raise ConfigError(f"Missing required environment variable: {name}")
     return value
+
+
+def _parse_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_settings() -> Settings:
@@ -81,6 +89,7 @@ def load_settings() -> Settings:
             max_book_spread_pct=float(os.getenv("MAX_BOOK_SPREAD_PCT", "0.02")),
             max_midpoint_deviation_ratio=float(os.getenv("MAX_MIDPOINT_DEVIATION_RATIO", "0.25")),
             max_sync_age_seconds=float(os.getenv("MAX_SYNC_AGE_SECONDS", "60.0")),
+            dry_run=_parse_bool("DRY_RUN", False),
             api_key=os.getenv("CLOB_API_KEY"),
             api_secret=os.getenv("CLOB_SECRET"),
             api_passphrase=os.getenv("CLOB_PASS_PHRASE"),
