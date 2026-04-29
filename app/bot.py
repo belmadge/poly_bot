@@ -233,6 +233,14 @@ class MarketMakerBot:
             seen_sides.add(side)
 
     def _get_confirmed_balances(self) -> tuple[float, float]:
+        if self.settings.dry_run:
+            # In dry run mode, use placeholder values
+            logger.info(
+                "Dry run mode: using placeholder balances",
+                extra={"event": "dry_run_balances", "token_id": self.settings.token_id},
+            )
+            return (1000.0, 1000.0)
+        
         collateral = self._with_retry(self.client.get_collateral_balance)
         token_balance = self._with_retry(lambda: self.client.get_token_balance(self.settings.token_id))
         if collateral is None or token_balance is None:

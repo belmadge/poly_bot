@@ -4,6 +4,7 @@ import logging
 import sys
 
 from app.config import Settings
+from app.log_buffer import MemoryLogHandler
 
 
 class ContextFilter(logging.Filter):
@@ -91,6 +92,10 @@ def setup_logging(settings: Settings) -> None:
     handler.setFormatter(_build_formatter(settings.log_format))
     handler.addFilter(ContextFilter(token_id=settings.token_id))
     root.addHandler(handler)
+
+    memory_handler = MemoryLogHandler()
+    memory_handler.addFilter(ContextFilter(token_id=settings.token_id))
+    root.addHandler(memory_handler)
 
 
 def _build_formatter(log_format: str) -> logging.Formatter:

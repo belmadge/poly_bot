@@ -76,21 +76,41 @@ class PolymarketClient:
         }
 
     def get_open_orders(self, token_id: str) -> list[dict[str, Any]]:
-        candidates = [
-            ("get_open_orders", {"token_id": token_id}),
-            ("get_orders", {"token_id": token_id}),
-            ("get_orders", {"market": token_id}),
-            ("list_orders", {"token_id": token_id}),
-            ("list_open_orders", {"token_id": token_id}),
-        ]
+        try:
+            from py_clob_client_v2.clob_types import OpenOrderParams
+        except Exception:  # noqa: BLE001
+            OpenOrderParams = None  # type: ignore[assignment]
+
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        if OpenOrderParams is not None:
+            candidates.append(("get_open_orders", {"params": OpenOrderParams(asset_id=token_id)}))
+        candidates.extend(
+            [
+                ("get_open_orders", {"token_id": token_id}),
+                ("get_open_orders", {}),
+                ("get_orders", {"token_id": token_id}),
+                ("get_orders", {"market": token_id}),
+                ("list_orders", {"token_id": token_id}),
+                ("list_open_orders", {"token_id": token_id}),
+            ]
+        )
+
+        last_error: PolymarketApiError | None = None
         for method_name, kwargs in candidates:
             if not hasattr(self.client, method_name):
                 continue
-            payload = self._call_client(self.client, method_name, **kwargs)
+            try:
+                payload = self._call_client(self.client, method_name, **kwargs)
+            except PolymarketApiError as exc:
+                last_error = exc
+                continue
             orders = [self._to_dict(item) for item in self._extract_list(payload, ("orders", "data", "items", "results"))]
             if method_name in {"get_open_orders", "list_open_orders"}:
                 return orders
             return [order for order in orders if self._extract_status(order) in OPEN_STATUSES]
+
+        if last_error is not None:
+            raise last_error
         return []
 
     def get_collateral_balance(self) -> float | None:

@@ -83,6 +83,35 @@ copy .env.example .env
 python main.py
 ```
 
+## Dashboard web
+
+Para abrir o painel local no navegador:
+
+```bash
+python main_web.py
+```
+
+Depois acesse:
+
+```text
+http://127.0.0.1:8000
+```
+
+Voce pode ajustar host e porta com:
+
+- `WEB_HOST`
+- `WEB_PORT`
+
+O painel mostra:
+
+- status do bot
+- start e stop pelo navegador
+- `gross_bought`
+- `gross_sold`
+- `position_size`
+- `realized_pnl`
+- pausas de protecao, erros e logs recentes
+
 ## Testes
 
 ```bash
