@@ -13,306 +13,360 @@ from app.log_buffer import get_recent_logs
 logger = logging.getLogger(__name__)
 
 _DASHBOARD_HTML = """<!doctype html>
-<html lang="en">
+<html lang="pt-BR">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PolyBot Dashboard</title>
+  <title>PolyBot - Painel de Controle</title>
   <style>
     :root {
-      --bg: #f4efe7;
-      --panel: rgba(255, 250, 244, 0.92);
-      --ink: #1e1f1b;
-      --muted: #6a665d;
-      --accent: #0f766e;
-      --accent-2: #b45309;
-      --danger: #b91c1c;
-      --line: rgba(30, 31, 27, 0.1);
-      --shadow: 0 18px 40px rgba(47, 39, 30, 0.14);
+      --primary: #10b981;
+      --primary-dark: #059669;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+      --bg: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-tertiary: #334155;
+      --text: #f1f5f9;
+      --text-muted: #cbd5e1;
+      --border: #475569;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: Georgia, "Times New Roman", serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(180, 83, 9, 0.12), transparent 28%),
-        radial-gradient(circle at top right, rgba(15, 118, 110, 0.16), transparent 24%),
-        linear-gradient(180deg, #f8f3eb 0%, var(--bg) 100%);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: var(--text);
+      background: linear-gradient(135deg, var(--bg) 0%, #1a1f35 100%);
       min-height: 100vh;
+      padding: 20px;
     }
     .shell {
       max-width: 1200px;
       margin: 0 auto;
-      padding: 32px 20px 40px;
     }
-    .hero {
-      display: grid;
-      grid-template-columns: 1.6fr 1fr;
-      gap: 18px;
-      align-items: stretch;
-    }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 24px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
-    }
-    .hero-copy {
-      padding: 28px;
-    }
-    h1 {
-      margin: 0 0 12px;
-      font-size: clamp(2.2rem, 4vw, 4.3rem);
-      line-height: 0.92;
-      letter-spacing: -0.04em;
-    }
-    .subtitle {
-      margin: 0;
-      color: var(--muted);
-      font-size: 1rem;
-      line-height: 1.6;
-      max-width: 58ch;
-    }
-    .hero-side {
-      padding: 24px;
+    .header {
       display: flex;
-      flex-direction: column;
       justify-content: space-between;
-      gap: 16px;
-      background:
-        linear-gradient(140deg, rgba(15, 118, 110, 0.9), rgba(8, 47, 73, 0.9)),
-        linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0));
-      color: #f9fafb;
-    }
-    .status-line {
-      display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 16px;
+      margin-bottom: 40px;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+    .header-title h1 {
+      margin: 0;
+      font-size: 2.5rem;
+      font-weight: 700;
+    }
+    .header-subtitle {
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+    .status-control {
+      display: flex;
+      gap: 12px;
+      align-items: center;
       flex-wrap: wrap;
     }
-    .badge {
+    .status-badge {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 10px 14px;
+      padding: 10px 16px;
       border-radius: 999px;
-      font-size: 0.92rem;
-      background: rgba(255,255,255,0.12);
-      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--primary);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      font-weight: 600;
     }
-    .actions {
+    .status-badge.stopped {
+      background: rgba(107, 114, 128, 0.15);
+      color: var(--text-muted);
+      border-color: rgba(107, 114, 128, 0.3);
+    }
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .metric-card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      transition: all 0.3s ease;
+    }
+    .metric-card:hover {
+      border-color: var(--primary);
+      box-shadow: 0 0 20px rgba(16, 185, 129, 0.1);
+    }
+    .metric-label {
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
+    .metric-value {
+      font-size: 2rem;
+      font-weight: 700;
+      color: var(--primary);
+      margin: 0;
+    }
+    .metric-unit {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      margin-top: 4px;
+    }
+    .section {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+    .section-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(0, 0, 0, 0.2);
+    }
+    .section-header h2 {
+      margin: 0;
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .section-body {
+      padding: 20px;
+    }
+    .info-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+    }
+    .info-label {
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+    .info-value {
+      color: var(--text);
+      font-size: 1rem;
+      font-weight: 500;
+      word-break: break-word;
+    }
+    .logs-container {
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    .log-item {
+      padding: 12px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 12px;
+      font-size: 0.9rem;
+    }
+    .log-time {
+      color: var(--text-muted);
+      white-space: nowrap;
+      font-size: 0.8rem;
+      min-width: 160px;
+    }
+    .log-badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      white-space: nowrap;
+      background: rgba(16, 185, 129, 0.2);
+      color: var(--primary);
+    }
+    .log-badge.error {
+      background: rgba(239, 68, 68, 0.2);
+      color: var(--danger);
+    }
+    .log-badge.warning {
+      background: rgba(245, 158, 11, 0.2);
+      color: var(--warning);
+    }
+    .log-message {
+      flex: 1;
+      color: var(--text-muted);
+    }
+    .buttons {
       display: flex;
       gap: 12px;
       flex-wrap: wrap;
     }
     button {
-      border: 0;
-      border-radius: 999px;
-      padding: 12px 18px;
+      padding: 12px 24px;
+      border: none;
+      border-radius: 8px;
       font: inherit;
+      font-weight: 600;
       cursor: pointer;
-      transition: transform 120ms ease, opacity 120ms ease, background 120ms ease;
+      transition: all 0.2s ease;
     }
-    button:hover { transform: translateY(-1px); }
-    button:disabled { opacity: 0.5; cursor: wait; transform: none; }
-    .primary { background: #f8fafc; color: #062c2c; }
-    .ghost { background: rgba(255,255,255,0.12); color: #f8fafc; border: 1px solid rgba(255,255,255,0.16); }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 16px;
-      margin-top: 18px;
+    .btn-primary {
+      background: var(--primary);
+      color: white;
     }
-    .card {
-      padding: 20px;
-      min-height: 136px;
-      position: relative;
-      overflow: hidden;
+    .btn-primary:hover:not(:disabled) {
+      background: var(--primary-dark);
+      transform: translateY(-2px);
+      box-shadow: 0 10px 20px rgba(16, 185, 129, 0.2);
     }
-    .card::after {
-      content: "";
-      position: absolute;
-      inset: auto -40px -40px auto;
-      width: 120px;
-      height: 120px;
-      border-radius: 999px;
-      background: rgba(15, 118, 110, 0.07);
+    .btn-secondary {
+      background: var(--bg-tertiary);
+      color: var(--text);
+      border: 1px solid var(--border);
     }
-    .eyebrow {
-      margin: 0 0 12px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-      font-size: 0.72rem;
+    .btn-secondary:hover:not(:disabled) {
+      background: var(--border);
+      transform: translateY(-2px);
     }
-    .metric {
-      margin: 0;
-      font-size: clamp(1.9rem, 2.6vw, 2.8rem);
-      line-height: 1;
-      letter-spacing: -0.04em;
+    button:disabled {
+      opacity: 0.5;
+      cursor: wait;
     }
-    .metric-note {
-      margin-top: 10px;
-      color: var(--muted);
-      font-size: 0.95rem;
-    }
-    .meta {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-      margin-top: 18px;
-    }
-    .meta-box, .log-box {
-      padding: 22px;
-    }
-    .meta-list {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px 18px;
-      margin-top: 10px;
-    }
-    .meta-item span {
-      display: block;
-    }
-    .meta-label {
-      color: var(--muted);
-      font-size: 0.78rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      margin-bottom: 5px;
-    }
-    .meta-value {
-      font-size: 1.06rem;
-      word-break: break-word;
-    }
-    .error {
-      margin-top: 14px;
-      padding: 12px 14px;
-      border-radius: 16px;
-      background: rgba(185, 28, 28, 0.08);
-      border: 1px solid rgba(185, 28, 28, 0.18);
+    .error-box {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.3);
       color: var(--danger);
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin-top: 12px;
       display: none;
     }
-    .logs {
-      max-height: 420px;
-      overflow: auto;
-      margin-top: 14px;
-      border-top: 1px solid var(--line);
-      padding-top: 12px;
+    .error-box.show {
+      display: block;
     }
-    .log-row {
-      padding: 12px 0;
-      border-bottom: 1px solid rgba(30, 31, 27, 0.08);
-    }
-    .log-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-      font-size: 0.86rem;
-      color: var(--muted);
-    }
-    .log-message {
-      margin-top: 6px;
-      font-size: 0.98rem;
-      line-height: 1.5;
-    }
-    .pill {
+    .spinner {
       display: inline-block;
-      padding: 4px 8px;
-      border-radius: 999px;
-      background: rgba(15, 118, 110, 0.08);
-      color: var(--accent);
-      font-size: 0.82rem;
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(16, 185, 129, 0.3);
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
     }
-    @media (max-width: 980px) {
-      .hero, .meta { grid-template-columns: 1fr; }
-      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .meta-list { grid-template-columns: 1fr; }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
     }
-    @media (max-width: 640px) {
-      .shell { padding: 20px 14px 30px; }
-      .grid { grid-template-columns: 1fr; }
-      h1 { font-size: 2.3rem; }
+    @media (max-width: 768px) {
+      .header { flex-direction: column; align-items: flex-start; }
+      .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+      .info-grid { grid-template-columns: 1fr; }
+      .header-title h1 { font-size: 1.8rem; }
+    }
+    @media (max-width: 480px) {
+      .metrics-grid { grid-template-columns: 1fr; }
+      button { width: 100%; }
+      .buttons { flex-direction: column; }
     }
   </style>
 </head>
 <body>
   <main class="shell">
-    <section class="hero">
-      <article class="panel hero-copy">
-        <p class="eyebrow">Polymarket Desk</p>
-        <h1>PolyBot Web Command</h1>
-        <p class="subtitle">Painel local para acompanhar operacao, inventario, pausas de protecao e ultimos eventos do market maker em tempo real.</p>
-      </article>
-      <aside class="panel hero-side">
-        <div class="status-line">
-          <div id="statusBadge" class="badge">Loading status...</div>
-          <div class="actions">
-            <button id="startBtn" class="primary">Start Bot</button>
-            <button id="stopBtn" class="ghost">Stop Bot</button>
+    <div class="header">
+      <div class="header-title">
+        <h1>🤖 PolyBot</h1>
+        <div class="header-subtitle">Painel de Controle do Market Maker</div>
+      </div>
+      <div class="status-control">
+        <div id="statusBadge" class="status-badge">
+          <span class="spinner"></span>
+          Carregando...
+        </div>
+        <div class="buttons">
+          <button id="startBtn" class="btn-primary">▶ Iniciar Bot</button>
+          <button id="stopBtn" class="btn-secondary">⏹ Parar Bot</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-label">📊 Volume Comprado</div>
+        <p class="metric-value" id="grossBought">-</p>
+        <div class="metric-unit">Total em compras</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">📊 Volume Vendido</div>
+        <p class="metric-value" id="grossSold">-</p>
+        <div class="metric-unit">Total em vendas</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">💰 Posição Atual</div>
+        <p class="metric-value" id="positionSize">-</p>
+        <div class="metric-unit" id="netPositionNote">Posição líquida</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">📈 Lucro Realizado</div>
+        <p class="metric-value" id="realizedPnl">-</p>
+        <div class="metric-unit">PnL</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        <h2>⚙️ Informações do Sistema</h2>
+      </div>
+      <div class="section-body">
+        <div class="info-grid">
+          <div>
+            <div class="info-label">Mercado (Token ID)</div>
+            <div class="info-value" id="tokenId">-</div>
+          </div>
+          <div>
+            <div class="info-label">Modo</div>
+            <div class="info-value" id="dryRun">-</div>
+          </div>
+          <div>
+            <div class="info-label">Ordens Abertas</div>
+            <div class="info-value" id="openOrders">-</div>
+          </div>
+          <div>
+            <div class="info-label">Trades Executados</div>
+            <div class="info-value" id="tradesExecuted">-</div>
+          </div>
+          <div>
+            <div class="info-label">Ciclos sem Preenchimento</div>
+            <div class="info-value" id="cyclesWithoutFill">-</div>
+          </div>
+          <div>
+            <div class="info-label">Erros de API</div>
+            <div class="info-value" id="apiErrors">-</div>
+          </div>
+          <div>
+            <div class="info-label">Último Preço</div>
+            <div class="info-value" id="lastMarketPrice">-</div>
+          </div>
+          <div>
+            <div class="info-label">Pausa Até</div>
+            <div class="info-value" id="pausedUntil">-</div>
           </div>
         </div>
-        <div>
-          <p class="eyebrow" style="color: rgba(248,250,252,0.72);">Control</p>
-          <div id="controlMessage">Use o painel para iniciar, parar e observar o estado atual do bot.</div>
-        </div>
-      </aside>
-    </section>
+        <div id="errorBox" class="error-box"></div>
+      </div>
+    </div>
 
-    <section class="grid">
-      <article class="panel card">
-        <p class="eyebrow">Gross Bought</p>
-        <p id="grossBought" class="metric">-</p>
-        <div class="metric-note">Quanto entrou na compra</div>
-      </article>
-      <article class="panel card">
-        <p class="eyebrow">Gross Sold</p>
-        <p id="grossSold" class="metric">-</p>
-        <div class="metric-note">Quanto saiu na venda</div>
-      </article>
-      <article class="panel card">
-        <p class="eyebrow">Current Position</p>
-        <p id="positionSize" class="metric">-</p>
-        <div id="netPositionNote" class="metric-note">Posicao liquida atual</div>
-      </article>
-      <article class="panel card">
-        <p class="eyebrow">Realized PnL</p>
-        <p id="realizedPnl" class="metric">-</p>
-        <div class="metric-note">Resultado realizado</div>
-      </article>
-    </section>
-
-    <section class="meta">
-      <article class="panel meta-box">
-        <p class="eyebrow">Runtime</p>
-        <div class="meta-list">
-          <div class="meta-item"><span class="meta-label">Token</span><span id="tokenId" class="meta-value">-</span></div>
-          <div class="meta-item"><span class="meta-label">Dry Run</span><span id="dryRun" class="meta-value">-</span></div>
-          <div class="meta-item"><span class="meta-label">Open Orders</span><span id="openOrders" class="meta-value">-</span></div>
-          <div class="meta-item"><span class="meta-label">Trades Executed</span><span id="tradesExecuted" class="meta-value">-</span></div>
-          <div class="meta-item"><span class="meta-label">Cycles Without Fill</span><span id="cyclesWithoutFill" class="meta-value">-</span></div>
-          <div class="meta-item"><span class="meta-label">API Errors</span><span id="apiErrors" class="meta-value">-</span></div>
-          <div class="meta-item"><span class="meta-label">Last Price</span><span id="lastMarketPrice" class="meta-value">-</span></div>
-          <div class="meta-item"><span class="meta-label">Paused Until</span><span id="pausedUntil" class="meta-value">-</span></div>
-        </div>
-        <div id="errorBox" class="error"></div>
-      </article>
-
-      <article class="panel log-box">
-        <p class="eyebrow">Recent Events</p>
-        <div id="logs" class="logs"></div>
-      </article>
-    </section>
+    <div class="section">
+      <div class="section-header">
+        <h2>📋 Eventos Recentes</h2>
+      </div>
+      <div class="section-body">
+        <div id="logs" class="logs-container"></div>
+      </div>
+    </div>
   </main>
 
   <script>
     const statusBadge = document.getElementById("statusBadge");
-    const controlMessage = document.getElementById("controlMessage");
     const errorBox = document.getElementById("errorBox");
     const startBtn = document.getElementById("startBtn");
     const stopBtn = document.getElementById("stopBtn");
@@ -325,11 +379,20 @@ _DASHBOARD_HTML = """<!doctype html>
 
     function fmtTime(value) {
       if (!value || value <= 0) return "-";
-      return new Date(value * 1000).toLocaleString();
+      const d = new Date(value * 1000);
+      return d.toLocaleString("pt-BR");
     }
 
     function setMetric(id, value, digits = 4) {
       document.getElementById(id).textContent = fmt(value, digits);
+    }
+
+    function getLevelColor(level) {
+      if (!level) return "INFO";
+      const l = level.toUpperCase();
+      if (l.includes("ERROR") || l.includes("ERRO")) return "error";
+      if (l.includes("WARNING") || l.includes("AVISO")) return "warning";
+      return "INFO";
     }
 
     async function callAction(path, button) {
@@ -337,63 +400,74 @@ _DASHBOARD_HTML = """<!doctype html>
       try {
         const response = await fetch(path, { method: "POST" });
         const payload = await response.json();
-        controlMessage.textContent = payload.message || "Action completed";
-        await refresh();
+        setTimeout(() => refresh(), 500);
       } catch (error) {
-        controlMessage.textContent = "Action failed: " + error.message;
+        console.error(error);
       } finally {
         button.disabled = false;
       }
     }
 
     async function refreshStatus() {
-      const response = await fetch("/api/status");
-      const payload = await response.json();
-      const metrics = payload.metrics || {};
+      try {
+        const response = await fetch("/api/status");
+        const payload = await response.json();
+        const metrics = payload.metrics || {};
 
-      statusBadge.textContent = payload.running ? "Bot running" : "Bot stopped";
-      statusBadge.style.background = payload.running ? "rgba(16, 185, 129, 0.16)" : "rgba(248, 250, 252, 0.12)";
+        const running = payload.running;
+        statusBadge.textContent = running ? "✓ Bot Ativo" : "○ Bot Parado";
+        statusBadge.className = running ? "status-badge" : "status-badge stopped";
 
-      document.getElementById("tokenId").textContent = payload.token_id || "-";
-      document.getElementById("dryRun").textContent = payload.dry_run === null ? "-" : (payload.dry_run ? "true" : "false");
-      document.getElementById("openOrders").textContent = metrics.open_orders ?? "-";
-      document.getElementById("tradesExecuted").textContent = metrics.trades_executed ?? "-";
-      document.getElementById("cyclesWithoutFill").textContent = metrics.cycles_without_fill ?? "-";
-      document.getElementById("apiErrors").textContent = metrics.consecutive_api_errors ?? "-";
-      document.getElementById("lastMarketPrice").textContent = fmt(metrics.last_market_price, 4);
-      document.getElementById("pausedUntil").textContent = fmtTime(metrics.paused_until);
+        startBtn.disabled = running;
+        stopBtn.disabled = !running;
 
-      setMetric("grossBought", metrics.gross_bought);
-      setMetric("grossSold", metrics.gross_sold);
-      setMetric("positionSize", metrics.position_size);
-      setMetric("realizedPnl", metrics.realized_pnl);
-      document.getElementById("netPositionNote").textContent = "Net position: " + fmt(metrics.net_position);
+        document.getElementById("tokenId").textContent = payload.token_id || "-";
+        const dryRunText = payload.dry_run === null ? "-" : (payload.dry_run ? "🔒 Simulação (DRY_RUN)" : "🔴 Produção");
+        document.getElementById("dryRun").textContent = dryRunText;
+        document.getElementById("openOrders").textContent = metrics.open_orders ?? "-";
+        document.getElementById("tradesExecuted").textContent = metrics.trades_executed ?? "-";
+        document.getElementById("cyclesWithoutFill").textContent = metrics.cycles_without_fill ?? "-";
+        document.getElementById("apiErrors").textContent = metrics.consecutive_api_errors ?? "-";
+        document.getElementById("lastMarketPrice").textContent = fmt(metrics.last_market_price, 4);
+        document.getElementById("pausedUntil").textContent = fmtTime(metrics.paused_until);
 
-      if (payload.last_error) {
-        errorBox.style.display = "block";
-        errorBox.textContent = payload.last_error;
-      } else {
-        errorBox.style.display = "none";
-        errorBox.textContent = "";
+        setMetric("grossBought", metrics.gross_bought);
+        setMetric("grossSold", metrics.gross_sold);
+        setMetric("positionSize", metrics.position_size);
+        setMetric("realizedPnl", metrics.realized_pnl);
+        document.getElementById("netPositionNote").textContent = "Posição: " + fmt(metrics.net_position);
+
+        if (payload.last_error) {
+          errorBox.classList.add("show");
+          errorBox.textContent = "⚠️ " + payload.last_error;
+        } else {
+          errorBox.classList.remove("show");
+        }
+      } catch (error) {
+        console.error("Status update failed:", error);
       }
     }
 
     async function refreshLogs() {
-      const response = await fetch("/api/logs?limit=80");
-      const payload = await response.json();
-      const container = document.getElementById("logs");
-      container.innerHTML = "";
-      for (const item of payload.logs || []) {
-        const row = document.createElement("div");
-        row.className = "log-row";
-        row.innerHTML = `
-          <div class="log-head">
-            <span>${item.timestamp || ""}</span>
-            <span><span class="pill">${item.level || "INFO"}</span> ${item.event || ""}</span>
-          </div>
-          <div class="log-message">${item.message || ""}</div>
-        `;
-        container.appendChild(row);
+      try {
+        const response = await fetch("/api/logs?limit=50");
+        const payload = await response.json();
+        const container = document.getElementById("logs");
+        container.innerHTML = "";
+        
+        for (const item of payload.logs || []) {
+          const row = document.createElement("div");
+          row.className = "log-item";
+          const levelColor = getLevelColor(item.level);
+          row.innerHTML = `
+            <div class="log-time">${item.timestamp || "-"}</div>
+            <div class="log-badge ${levelColor}">${item.level || "INFO"}</div>
+            <div class="log-message">${item.message || item.event || "-"}</div>
+          `;
+          container.appendChild(row);
+        }
+      } catch (error) {
+        console.error("Logs update failed:", error);
       }
     }
 
