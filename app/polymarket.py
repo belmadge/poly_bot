@@ -135,6 +135,12 @@ class PolymarketClient:
 
         raise PolymarketApiError("Cancel method not available in current py-clob-client-v2 version.")
 
+    def get_order_details(self, order_id: str) -> dict[str, Any] | None:
+        for method_name in ("get_order", "get_order_by_id"):
+            if hasattr(self.client, method_name):
+                return self._to_dict(self._call_client(self.client, method_name, order_id=order_id))
+        return None
+
     def place_limit_order(self, token_id: str, side: str, price: float, size: float) -> dict[str, Any]:
         enum_side = Side.BUY if side.lower() == "buy" else Side.SELL
         response = self._call_client(
@@ -212,6 +218,14 @@ class PolymarketClient:
     @staticmethod
     def extract_status(order: dict[str, Any]) -> str:
         return PolymarketClient._extract_status(order)
+
+    @staticmethod
+    def extract_filled_size(order: dict[str, Any]) -> float | None:
+        for key in ("filled_size", "filled", "matched_size", "executed_size", "size_matched"):
+            value = order.get(key)
+            if value is not None:
+                return float(value)
+        return None
 
     @staticmethod
     def _extract_status(order: dict[str, Any]) -> str:

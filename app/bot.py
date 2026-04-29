@@ -29,6 +29,12 @@ class MarketMakerBot:
         state = self.state_store.load()
         self.known_orders: dict[str, dict[str, Any]] = state.known_orders
         self.last_market_price: float | None = state.last_market_price
+        self.position_size: float = state.position_size
+        self.average_entry_price: float = state.average_entry_price
+        self.realized_pnl: float = state.realized_pnl
+        self.trades_executed: int = state.trades_executed
+        self.cancel_timestamps: list[float] = state.cancel_timestamps or []
+        self.paused_until: float = state.paused_until
         self.consecutive_api_errors: int = state.consecutive_api_errors
         self.last_api_error_time: float = state.last_api_error_time
         self.last_api_sync_time: float = state.last_api_sync_time
@@ -102,6 +108,12 @@ class MarketMakerBot:
         self._validate_state_or_raise()
         collateral, token_balance = self._get_confirmed_balances()
         market = self._get_valid_market_snapshot()
+        if not market:
+            logger.info(
+                "Cycle skipped due to market conditions",
+                extra={"event": "cycle_skip_market_conditions", "token_id": self.settings.token_id},
+            )
+            return
         quotes = self._build_quotes(market["midpoint"])
 
         self._ensure_fresh_sync()
@@ -123,7 +135,7 @@ class MarketMakerBot:
 
     def list_open_orders(self) -> list[dict[str, Any]]:
         orders = self._with_retry(lambda: self.client.get_open_orders(self.settings.token_id))
-        self.known_orders = self._snapshots_by_id(orders)
+        self.known_orders = self._snapshots_by_id(orders, self.known_orders)
         logger.debug(
             "Open orders loaded from API",
             extra={"event": "open_orders", "token_id": self.settings.token_id, "count": len(orders)},
@@ -147,6 +159,7 @@ class MarketMakerBot:
             )
             return
         self._with_retry(lambda: self.client.cancel_orders(order_ids))
+        self._record_cancellation()
         self._sync_orders_with_api()
         logger.info(
             "Orders cancelled successfully",
@@ -170,7 +183,14 @@ class MarketMakerBot:
 
     def _sync_orders_with_api(self) -> None:
         orders = self._with_retry(lambda: self.client.get_open_orders(self.settings.token_id))
-        self.known_orders = self._snapshots_by_id(orders)
+        previous_orders = dict(self.known_orders)
+        current_order_ids = {
+            self.client.extract_order_id(order)
+            for order in orders
+            if self.client.extract_order_id(order)
+        }
+        self._process_closed_orders(previous_orders, current_order_ids)
+        self.known_orders = self._snapshots_by_id(orders, previous_orders)
         self.last_api_sync_time = time.time()
         logger.debug(
             "API sync complete",
@@ -217,6 +237,18 @@ class MarketMakerBot:
         midpoint = float(market["midpoint"])
         spread = float(market["book_spread"])
 
+        if spread < self.settings.min_operable_spread:
+            logger.warning(
+                "Spread too small, skipping cycle",
+                extra={"event": "market_spread_too_small", "token_id": self.settings.token_id, "book_spread": spread},
+            )
+            return {}
+        if spread > self.settings.max_operable_spread:
+            logger.warning(
+                "Spread too large, skipping cycle",
+                extra={"event": "market_spread_too_large", "token_id": self.settings.token_id, "book_spread": spread},
+            )
+            return {}
         if midpoint < self.settings.min_price_bound or midpoint > self.settings.max_price_bound:
             raise PolymarketApiError(f"Midpoint outside configured bounds: {midpoint}")
         if midpoint <= 0:
@@ -276,6 +308,20 @@ class MarketMakerBot:
         if len(open_orders) > 2:
             logger.warning("Too many open orders for fixed strategy", extra={"event": "refresh_too_many_orders", "count": len(open_orders)})
             return True
+        now = time.time()
+        for order in open_orders:
+            first_seen_at = float(order.get("first_seen_at") or now)
+            if now - first_seen_at > self.settings.max_order_age_seconds:
+                logger.info(
+                    "Refreshing stale order by timeout",
+                    extra={
+                        "event": "refresh_order_timeout",
+                        "token_id": self.settings.token_id,
+                        "order_id": self.client.extract_order_id(order),
+                        "age_seconds": round(now - first_seen_at, 1),
+                    },
+                )
+                return True
 
         price_move_ratio = 0.0
         if self.last_market_price not in {None, 0}:
@@ -313,7 +359,20 @@ class MarketMakerBot:
         token_balance: float,
         open_orders: list[dict[str, Any]],
     ) -> None:
+        if self._placement_paused():
+            logger.warning(
+                "Order placement paused after excessive churn",
+                extra={"event": "placement_paused", "token_id": self.settings.token_id, "paused_until": self.paused_until},
+            )
+            return
+        placed_count = 0
         for side in ("buy", "sell"):
+            if placed_count >= self.settings.max_orders_per_cycle:
+                logger.warning(
+                    "Max orders per cycle reached",
+                    extra={"event": "max_orders_per_cycle_reached", "token_id": self.settings.token_id, "count": placed_count},
+                )
+                break
             quote = quotes[side]
             if self._has_matching_order(open_orders, quote):
                 logger.debug(
@@ -342,8 +401,10 @@ class MarketMakerBot:
                     continue
 
             self._place_order(quote)
-            self._sync_orders_with_api()
-            open_orders = list(self.known_orders.values())
+            placed_count += 1
+            if not self.settings.dry_run:
+                self._sync_orders_with_api()
+                open_orders = list(self.known_orders.values())
 
     def _place_order(self, quote: Quote) -> None:
         if not self._quote_is_complete(quote):
@@ -397,18 +458,21 @@ class MarketMakerBot:
     def _quote_is_complete(quote: Quote) -> bool:
         return quote.side in {"buy", "sell"} and quote.price > 0 and quote.size > 0
 
-    def _snapshots_by_id(self, orders: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    def _snapshots_by_id(self, orders: list[dict[str, Any]], previous_orders: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         snapshots: dict[str, dict[str, Any]] = {}
+        now = time.time()
         for order in orders:
             order_id = self.client.extract_order_id(order)
             if not order_id:
                 raise PolymarketApiError("Open order returned by API without id")
+            previous_snapshot = previous_orders.get(order_id, {})
             snapshots[order_id] = {
                 "token_id": self.settings.token_id,
                 "side": self.client.extract_side(order),
                 "price": self.client.extract_price(order),
                 "size": self.client.extract_size(order),
                 "status": self.client.extract_status(order),
+                "first_seen_at": float(previous_snapshot.get("first_seen_at") or now),
                 "raw": order,
             }
         return snapshots
@@ -418,6 +482,12 @@ class MarketMakerBot:
             BotState(
                 known_orders=self.known_orders,
                 last_market_price=self.last_market_price,
+                position_size=self.position_size,
+                average_entry_price=self.average_entry_price,
+                realized_pnl=self.realized_pnl,
+                trades_executed=self.trades_executed,
+                cancel_timestamps=self.cancel_timestamps,
+                paused_until=self.paused_until,
                 consecutive_api_errors=self.consecutive_api_errors,
                 last_api_error_time=self.last_api_error_time,
                 last_api_sync_time=self.last_api_sync_time,
@@ -426,3 +496,76 @@ class MarketMakerBot:
 
     def _check_kill_switch(self) -> bool:
         return Path(self.settings.kill_switch_flag_file).exists()
+
+    def _process_closed_orders(self, previous_orders: dict[str, dict[str, Any]], current_order_ids: set[str]) -> None:
+        for order_id, snapshot in previous_orders.items():
+            if order_id in current_order_ids:
+                continue
+            details = self._with_retry(lambda order_id=order_id: self.client.get_order_details(order_id))
+            if not details:
+                logger.warning(
+                    "Order disappeared without details",
+                    extra={"event": "closed_order_missing_details", "token_id": self.settings.token_id, "order_id": order_id},
+                )
+                continue
+            status = self.client.extract_status(details)
+            filled_size = self.client.extract_filled_size(details) or self.client.extract_size(details) or snapshot.get("size") or 0.0
+            if status in {"filled", "matched", "executed", "complete", "completed"} and filled_size > 0:
+                self._apply_fill(
+                    side=snapshot.get("side") or self.client.extract_side(details),
+                    price=float(self.client.extract_price(details) or snapshot.get("price") or 0.0),
+                    size=float(filled_size),
+                    order_id=order_id,
+                )
+
+    def _apply_fill(self, side: str, price: float, size: float, order_id: str) -> None:
+        if size <= 0 or price <= 0:
+            return
+        realized_delta = 0.0
+        if side == "buy":
+            total_cost = (self.average_entry_price * self.position_size) + (price * size)
+            self.position_size += size
+            self.average_entry_price = total_cost / self.position_size if self.position_size > 0 else 0.0
+        elif side == "sell":
+            matched_size = min(self.position_size, size)
+            realized_delta = (price - self.average_entry_price) * matched_size
+            self.realized_pnl += realized_delta
+            self.position_size = max(0.0, self.position_size - matched_size)
+            if self.position_size <= self.settings.price_tolerance:
+                self.position_size = 0.0
+                self.average_entry_price = 0.0
+        self.trades_executed += 1
+        logger.info(
+            "Fill processed",
+            extra={
+                "event": "fill_processed",
+                "token_id": self.settings.token_id,
+                "order_id": order_id,
+                "side": side,
+                "price": price,
+                "size": size,
+                "position_size": round(self.position_size, 4),
+                "realized_pnl": round(self.realized_pnl, 4),
+                "realized_delta": round(realized_delta, 4),
+            },
+        )
+
+    def _record_cancellation(self) -> None:
+        now = time.time()
+        one_minute_ago = now - 60.0
+        self.cancel_timestamps = [ts for ts in self.cancel_timestamps if ts >= one_minute_ago]
+        self.cancel_timestamps.append(now)
+        if len(self.cancel_timestamps) >= self.settings.max_cancels_per_minute:
+            self.paused_until = now + self.settings.pause_after_cancel_limit_seconds
+            logger.warning(
+                "Cancellation churn limit reached, pausing placement",
+                extra={
+                    "event": "cancel_churn_pause",
+                    "token_id": self.settings.token_id,
+                    "cancel_count": len(self.cancel_timestamps),
+                    "paused_until": self.paused_until,
+                },
+            )
+
+    def _placement_paused(self) -> bool:
+        return time.time() < self.paused_until

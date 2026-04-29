@@ -61,6 +61,12 @@ def settings(temp_state_file, kill_switch_path):
         max_book_spread_pct=0.02,
         max_midpoint_deviation_ratio=0.25,
         max_sync_age_seconds=60.0,
+        min_operable_spread=0.01,
+        max_operable_spread=0.20,
+        max_cancels_per_minute=3,
+        pause_after_cancel_limit_seconds=60.0,
+        max_order_age_seconds=300.0,
+        max_orders_per_cycle=2,
         dry_run=False,
     )
 
@@ -83,7 +89,9 @@ def mock_client():
     client.extract_price.side_effect = lambda order: order.get("price")
     client.extract_size.side_effect = lambda order: order.get("size")
     client.extract_status.side_effect = lambda order: order.get("status", "")
+    client.extract_filled_size.side_effect = lambda order: order.get("filled_size")
     client.place_limit_order.side_effect = lambda **kwargs: {"order_id": f"{kwargs['side']}-1", **kwargs}
+    client.get_order_details.return_value = None
     return client
 
 
@@ -129,6 +137,17 @@ class TestFailClosed:
         with pytest.raises(PolymarketApiError):
             bot._get_valid_market_snapshot()
 
+    def test_market_snapshot_skips_small_spread(self, settings, mock_client):
+        bot = MarketMakerBot(settings, mock_client)
+        mock_client.get_market_snapshot.return_value = {
+            "token_id": "test-token",
+            "midpoint": 0.50,
+            "book_spread": 0.005,
+            "best_bid": 0.4975,
+            "best_ask": 0.5025,
+        }
+        assert bot._get_valid_market_snapshot() == {}
+
 
 class TestStateAndSync:
     def test_sync_uses_api_as_source_of_truth(self, settings, mock_client):
@@ -156,6 +175,16 @@ class TestStateAndSync:
             bot._ensure_fresh_sync()
         sync_mock.assert_called_once()
 
+    def test_sync_processes_realized_pnl_on_closed_sell(self, settings, mock_client):
+        bot = MarketMakerBot(settings, mock_client)
+        bot.position_size = 1.0
+        bot.average_entry_price = 0.40
+        bot.known_orders = {"sell-1": {"token_id": "test-token", "side": "sell", "price": 0.50, "size": 1.0, "status": "open"}}
+        mock_client.get_open_orders.return_value = []
+        mock_client.get_order_details.return_value = {"order_id": "sell-1", "status": "filled", "price": 0.50, "size": 1.0, "filled_size": 1.0}
+        bot._sync_orders_with_api()
+        assert bot.realized_pnl == pytest.approx(0.10)
+
 
 class TestOrderFlow:
     def test_should_refresh_on_quote_mismatch(self, settings, mock_client):
@@ -178,6 +207,14 @@ class TestOrderFlow:
         assert mock_client.place_limit_order.call_count == 2
         assert sync_mock.call_count == 2
 
+    def test_place_missing_quotes_respects_max_orders_per_cycle(self, settings, mock_client):
+        limited_settings = replace(settings, max_orders_per_cycle=1)
+        bot = MarketMakerBot(limited_settings, mock_client)
+        quotes = {"buy": Quote("buy", 0.49, 10.0), "sell": Quote("sell", 0.51, 10.0)}
+        with patch.object(bot, "_sync_orders_with_api"):
+            bot._place_missing_quotes(quotes, collateral=100.0, token_balance=100.0, open_orders=[])
+        assert mock_client.place_limit_order.call_count == 1
+
     def test_dry_run_skips_order_placement(self, settings, mock_client):
         dry_settings = replace(settings, dry_run=True)
         bot = MarketMakerBot(dry_settings, mock_client)
@@ -189,6 +226,26 @@ class TestOrderFlow:
         bot = MarketMakerBot(dry_settings, mock_client)
         bot.cancel_open_orders([{"order_id": "buy-1", "side": "buy", "price": 0.49, "size": 10.0, "status": "open"}])
         assert mock_client.cancel_orders.call_count == 0
+
+    def test_cancel_churn_pauses_new_placements(self, settings, mock_client):
+        bot = MarketMakerBot(settings, mock_client)
+        bot.cancel_timestamps = [time.time(), time.time(), time.time()]
+        bot._record_cancellation()
+        assert bot._placement_paused() is True
+
+    def test_order_timeout_triggers_refresh(self, settings, mock_client):
+        timeout_settings = replace(settings, max_order_age_seconds=10.0)
+        bot = MarketMakerBot(timeout_settings, mock_client)
+        quotes = {"buy": Quote("buy", 0.49, 10.0), "sell": Quote("sell", 0.51, 10.0)}
+        old_order = {
+            "order_id": "buy-1",
+            "side": "buy",
+            "price": 0.49,
+            "size": 10.0,
+            "status": "open",
+            "first_seen_at": time.time() - 30.0,
+        }
+        assert bot._should_refresh_orders([old_order], quotes, 0.50) is True
 
 
 class TestRunLoop:

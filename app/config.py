@@ -34,6 +34,12 @@ class Settings:
     max_book_spread_pct: float
     max_midpoint_deviation_ratio: float
     max_sync_age_seconds: float
+    min_operable_spread: float
+    max_operable_spread: float
+    max_cancels_per_minute: int
+    pause_after_cancel_limit_seconds: float
+    max_order_age_seconds: float
+    max_orders_per_cycle: int
     dry_run: bool
     api_key: str | None = None
     api_secret: str | None = None
@@ -89,6 +95,12 @@ def load_settings() -> Settings:
             max_book_spread_pct=float(os.getenv("MAX_BOOK_SPREAD_PCT", "0.02")),
             max_midpoint_deviation_ratio=float(os.getenv("MAX_MIDPOINT_DEVIATION_RATIO", "0.25")),
             max_sync_age_seconds=float(os.getenv("MAX_SYNC_AGE_SECONDS", "60.0")),
+            min_operable_spread=float(os.getenv("MIN_OPERABLE_SPREAD", "0.01")),
+            max_operable_spread=float(os.getenv("MAX_OPERABLE_SPREAD", "0.20")),
+            max_cancels_per_minute=int(os.getenv("MAX_CANCELS_PER_MINUTE", "6")),
+            pause_after_cancel_limit_seconds=float(os.getenv("PAUSE_AFTER_CANCEL_LIMIT_SECONDS", "60.0")),
+            max_order_age_seconds=float(os.getenv("MAX_ORDER_AGE_SECONDS", "300.0")),
+            max_orders_per_cycle=int(os.getenv("MAX_ORDERS_PER_CYCLE", "2")),
             dry_run=_parse_bool("DRY_RUN", False),
             api_key=os.getenv("CLOB_API_KEY"),
             api_secret=os.getenv("CLOB_SECRET"),
