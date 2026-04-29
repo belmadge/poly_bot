@@ -67,6 +67,18 @@ def settings(temp_state_file, kill_switch_path):
         pause_after_cancel_limit_seconds=60.0,
         max_order_age_seconds=300.0,
         max_orders_per_cycle=2,
+        min_liquidity_score=10.0,
+        max_volatility_ratio=0.05,
+        fee_rate=0.0015,
+        estimated_slippage_rate=0.001,
+        min_profit_margin=0.0025,
+        inventory_target=0.0,
+        inventory_soft_limit=25.0,
+        inventory_price_adjustment=0.003,
+        protection_no_fill_cycles=4,
+        protection_error_streak=2,
+        protection_pause_seconds=180.0,
+        protection_spread_multiplier=1.5,
         dry_run=False,
     )
 
@@ -83,6 +95,10 @@ def mock_client():
         "book_spread": 0.01,
         "best_bid": 0.495,
         "best_ask": 0.505,
+        "raw_book": {
+            "bids": [{"price": 0.495, "size": 100.0}],
+            "asks": [{"price": 0.505, "size": 100.0}],
+        },
     }
     client.extract_order_id.side_effect = lambda order: order.get("order_id") if isinstance(order, dict) else None
     client.extract_side.side_effect = lambda order: order.get("side", "")
@@ -145,8 +161,44 @@ class TestFailClosed:
             "book_spread": 0.005,
             "best_bid": 0.4975,
             "best_ask": 0.5025,
+            "raw_book": {
+                "bids": [{"price": 0.4975, "size": 100.0}],
+                "asks": [{"price": 0.5025, "size": 100.0}],
+            },
         }
         assert bot._get_valid_market_snapshot() == {}
+
+    def test_market_snapshot_skips_low_liquidity(self, settings, mock_client):
+        bot = MarketMakerBot(settings, mock_client)
+        mock_client.get_market_snapshot.return_value = {
+            "token_id": "test-token",
+            "midpoint": 0.50,
+            "book_spread": 0.01,
+            "best_bid": 0.495,
+            "best_ask": 0.505,
+            "raw_book": {
+                "bids": [{"price": 0.495, "size": 1.0}],
+                "asks": [{"price": 0.505, "size": 1.0}],
+            },
+        }
+        assert bot._get_valid_market_snapshot() == {}
+
+    def test_market_snapshot_pauses_on_high_volatility(self, settings, mock_client):
+        bot = MarketMakerBot(settings, mock_client)
+        bot.last_market_price = 0.50
+        mock_client.get_market_snapshot.return_value = {
+            "token_id": "test-token",
+            "midpoint": 0.53,
+            "book_spread": 0.01,
+            "best_bid": 0.525,
+            "best_ask": 0.535,
+            "raw_book": {
+                "bids": [{"price": 0.525, "size": 100.0}],
+                "asks": [{"price": 0.535, "size": 100.0}],
+            },
+        }
+        assert bot._get_valid_market_snapshot() == {}
+        assert bot._placement_paused() is True
 
 
 class TestStateAndSync:
@@ -207,6 +259,24 @@ class TestOrderFlow:
         assert mock_client.place_limit_order.call_count == 2
         assert sync_mock.call_count == 2
 
+    def test_inventory_skew_makes_sell_more_aggressive_when_long(self, settings, mock_client):
+        bot = MarketMakerBot(settings, mock_client)
+        bot.position_size = 25.0
+        quotes = bot._build_quotes(0.50)
+        assert quotes["sell"].price < 0.51
+
+    def test_unprofitable_quotes_are_blocked(self, settings, mock_client):
+        tighter_profit_settings = replace(
+            settings,
+            spread=0.004,
+            min_profit_margin=0.003,
+            fee_rate=0.002,
+            estimated_slippage_rate=0.002,
+        )
+        bot = MarketMakerBot(tighter_profit_settings, mock_client)
+        quotes = bot._build_quotes(0.50)
+        assert bot._quotes_are_profitable(quotes, 0.50) is False
+
     def test_place_missing_quotes_respects_max_orders_per_cycle(self, settings, mock_client):
         limited_settings = replace(settings, max_orders_per_cycle=1)
         bot = MarketMakerBot(limited_settings, mock_client)
@@ -246,6 +316,14 @@ class TestOrderFlow:
             "first_seen_at": time.time() - 30.0,
         }
         assert bot._should_refresh_orders([old_order], quotes, 0.50) is True
+
+    def test_protection_mode_reduces_activity_after_idle_cycles(self, settings, mock_client):
+        bot = MarketMakerBot(settings, mock_client)
+        bot.cycles_without_fill = settings.protection_no_fill_cycles
+        quotes = {"buy": Quote("buy", 0.49, 10.0), "sell": Quote("sell", 0.51, 10.0)}
+        with patch.object(bot, "_sync_orders_with_api"):
+            bot._place_missing_quotes(quotes, collateral=100.0, token_balance=100.0, open_orders=[])
+        assert mock_client.place_limit_order.call_count == 1
 
 
 class TestRunLoop:

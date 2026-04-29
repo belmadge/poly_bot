@@ -40,6 +40,18 @@ class Settings:
     pause_after_cancel_limit_seconds: float
     max_order_age_seconds: float
     max_orders_per_cycle: int
+    min_liquidity_score: float
+    max_volatility_ratio: float
+    fee_rate: float
+    estimated_slippage_rate: float
+    min_profit_margin: float
+    inventory_target: float
+    inventory_soft_limit: float
+    inventory_price_adjustment: float
+    protection_no_fill_cycles: int
+    protection_error_streak: int
+    protection_pause_seconds: float
+    protection_spread_multiplier: float
     dry_run: bool
     api_key: str | None = None
     api_secret: str | None = None
@@ -101,6 +113,18 @@ def load_settings() -> Settings:
             pause_after_cancel_limit_seconds=float(os.getenv("PAUSE_AFTER_CANCEL_LIMIT_SECONDS", "60.0")),
             max_order_age_seconds=float(os.getenv("MAX_ORDER_AGE_SECONDS", "300.0")),
             max_orders_per_cycle=int(os.getenv("MAX_ORDERS_PER_CYCLE", "2")),
+            min_liquidity_score=float(os.getenv("MIN_LIQUIDITY_SCORE", "100.0")),
+            max_volatility_ratio=float(os.getenv("MAX_VOLATILITY_RATIO", "0.05")),
+            fee_rate=float(os.getenv("FEE_RATE", "0.0015")),
+            estimated_slippage_rate=float(os.getenv("ESTIMATED_SLIPPAGE_RATE", "0.001")),
+            min_profit_margin=float(os.getenv("MIN_PROFIT_MARGIN", "0.0025")),
+            inventory_target=float(os.getenv("INVENTORY_TARGET", "0.0")),
+            inventory_soft_limit=float(os.getenv("INVENTORY_SOFT_LIMIT", "25.0")),
+            inventory_price_adjustment=float(os.getenv("INVENTORY_PRICE_ADJUSTMENT", "0.003")),
+            protection_no_fill_cycles=int(os.getenv("PROTECTION_NO_FILL_CYCLES", "4")),
+            protection_error_streak=int(os.getenv("PROTECTION_ERROR_STREAK", "2")),
+            protection_pause_seconds=float(os.getenv("PROTECTION_PAUSE_SECONDS", "180.0")),
+            protection_spread_multiplier=float(os.getenv("PROTECTION_SPREAD_MULTIPLIER", "1.5")),
             dry_run=_parse_bool("DRY_RUN", False),
             api_key=os.getenv("CLOB_API_KEY"),
             api_secret=os.getenv("CLOB_SECRET"),

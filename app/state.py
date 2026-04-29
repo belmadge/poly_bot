@@ -19,6 +19,9 @@ class BotState:
     consecutive_api_errors: int = 0
     last_api_error_time: float = 0.0
     last_api_sync_time: float = 0.0
+    cycles_without_fill: int = 0
+    gross_bought: float = 0.0
+    gross_sold: float = 0.0
 
 
 class BotStateStore:
@@ -50,6 +53,9 @@ class BotStateStore:
             consecutive_api_errors=int(payload.get("consecutive_api_errors", 0)),
             last_api_error_time=float(payload.get("last_api_error_time", 0.0)),
             last_api_sync_time=float(payload.get("last_api_sync_time", 0.0)),
+            cycles_without_fill=int(payload.get("cycles_without_fill", 0)),
+            gross_bought=float(payload.get("gross_bought", 0.0)),
+            gross_sold=float(payload.get("gross_sold", 0.0)),
         )
 
     def save(self, state: BotState) -> None:
@@ -66,5 +72,8 @@ class BotStateStore:
             "consecutive_api_errors": state.consecutive_api_errors,
             "last_api_error_time": state.last_api_error_time,
             "last_api_sync_time": state.last_api_sync_time,
+            "cycles_without_fill": state.cycles_without_fill,
+            "gross_bought": state.gross_bought,
+            "gross_sold": state.gross_sold,
         }
         self.path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")

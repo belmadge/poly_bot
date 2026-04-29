@@ -38,6 +38,9 @@ class MarketMakerBot:
         self.consecutive_api_errors: int = state.consecutive_api_errors
         self.last_api_error_time: float = state.last_api_error_time
         self.last_api_sync_time: float = state.last_api_sync_time
+        self.cycles_without_fill: int = state.cycles_without_fill
+        self.gross_bought: float = state.gross_bought
+        self.gross_sold: float = state.gross_sold
         self.consecutive_execution_errors: int = 0
         self.shutdown_event = threading.Event()
 
@@ -71,6 +74,7 @@ class MarketMakerBot:
             except PolymarketApiError as exc:
                 self.consecutive_api_errors += 1
                 self.last_api_error_time = time.time()
+                self._pause_after_error_streak("api_errors", self.consecutive_api_errors)
                 logger.exception(
                     "Critical API error in main loop",
                     extra={
@@ -85,6 +89,7 @@ class MarketMakerBot:
                     self.shutdown_event.set()
             except Exception as exc:  # noqa: BLE001
                 self.consecutive_execution_errors += 1
+                self._pause_after_error_streak("execution_errors", self.consecutive_execution_errors)
                 logger.exception(
                     "Unexpected execution error",
                     extra={
@@ -104,6 +109,7 @@ class MarketMakerBot:
                     time.sleep(self.settings.loop_interval_seconds)
 
     def run_once(self) -> None:
+        trades_before_cycle = self.trades_executed
         self._sync_orders_with_api()
         self._validate_state_or_raise()
         collateral, token_balance = self._get_confirmed_balances()
@@ -113,8 +119,18 @@ class MarketMakerBot:
                 "Cycle skipped due to market conditions",
                 extra={"event": "cycle_skip_market_conditions", "token_id": self.settings.token_id},
             )
+            self._update_protection_state(trades_before_cycle)
             return
-        quotes = self._build_quotes(market["midpoint"])
+        quotes = self._build_quotes(market["midpoint"], market["spread_multiplier"])
+        if not self._quotes_are_profitable(quotes, market["midpoint"]):
+            self._log_non_operation(
+                "spread_not_profitable",
+                estimated_cost=round(self._estimate_round_trip_cost(market["midpoint"]), 6),
+                required_spread=round(self._required_profit_spread(market["midpoint"]), 6),
+                spread=round(quotes["sell"].price - quotes["buy"].price, 6),
+            )
+            self._update_protection_state(trades_before_cycle)
+            return
 
         self._ensure_fresh_sync()
         open_orders = list(self.known_orders.values())
@@ -128,6 +144,8 @@ class MarketMakerBot:
 
         self._place_missing_quotes(quotes, collateral, token_balance, open_orders)
         self.last_market_price = float(market["midpoint"])
+        self._update_protection_state(trades_before_cycle)
+        self._log_result_snapshot("cycle_result")
         logger.info(
             "Cycle completed successfully",
             extra={"event": "cycle_success", "token_id": self.settings.token_id, "open_orders": len(self.known_orders)},
@@ -236,18 +254,17 @@ class MarketMakerBot:
         market = self._with_retry(lambda: self.client.get_market_snapshot(self.settings.token_id))
         midpoint = float(market["midpoint"])
         spread = float(market["book_spread"])
+        liquidity_score = self._calculate_liquidity_score(market)
+        volatility_ratio = self._calculate_volatility_ratio(midpoint)
 
         if spread < self.settings.min_operable_spread:
-            logger.warning(
-                "Spread too small, skipping cycle",
-                extra={"event": "market_spread_too_small", "token_id": self.settings.token_id, "book_spread": spread},
-            )
+            self._log_non_operation("spread_below_threshold", book_spread=spread)
             return {}
         if spread > self.settings.max_operable_spread:
-            logger.warning(
-                "Spread too large, skipping cycle",
-                extra={"event": "market_spread_too_large", "token_id": self.settings.token_id, "book_spread": spread},
-            )
+            self._log_non_operation("spread_above_threshold", book_spread=spread)
+            return {}
+        if liquidity_score < self.settings.min_liquidity_score:
+            self._log_non_operation("low_liquidity", liquidity_score=round(liquidity_score, 4))
             return {}
         if midpoint < self.settings.min_price_bound or midpoint > self.settings.max_price_bound:
             raise PolymarketApiError(f"Midpoint outside configured bounds: {midpoint}")
@@ -262,7 +279,16 @@ class MarketMakerBot:
             deviation_ratio = abs(midpoint - float(self.last_market_price)) / abs(float(self.last_market_price))
             if deviation_ratio > self.settings.max_midpoint_deviation_ratio:
                 raise PolymarketApiError(f"Midpoint deviation too large: {deviation_ratio}")
+        if volatility_ratio >= self.settings.max_volatility_ratio:
+            self.paused_until = max(self.paused_until, time.time() + self.settings.protection_pause_seconds)
+            self._log_non_operation(
+                "high_volatility_pause",
+                volatility_ratio=round(volatility_ratio, 6),
+                paused_until=round(self.paused_until, 3),
+            )
+            return {}
 
+        spread_multiplier = self._determine_spread_multiplier(volatility_ratio)
         logger.info(
             "Market snapshot validated",
             extra={
@@ -271,14 +297,21 @@ class MarketMakerBot:
                 "price": midpoint,
                 "previous_price": self.last_market_price,
                 "book_spread": spread,
+                "liquidity_score": round(liquidity_score, 4),
+                "volatility_ratio": round(volatility_ratio, 6),
+                "spread_multiplier": spread_multiplier,
             },
         )
+        market["liquidity_score"] = liquidity_score
+        market["volatility_ratio"] = volatility_ratio
+        market["spread_multiplier"] = spread_multiplier
         return market
 
-    def _build_quotes(self, midpoint: float) -> dict[str, Quote]:
-        half_spread = self.settings.spread / 2.0
+    def _build_quotes(self, midpoint: float, spread_multiplier: float = 1.0) -> dict[str, Quote]:
+        half_spread = (self.settings.spread * spread_multiplier) / 2.0
         buy_price = round(max(self.settings.min_price_bound, midpoint - half_spread), 4)
         sell_price = round(min(self.settings.max_price_bound, midpoint + half_spread), 4)
+        buy_price, sell_price = self._apply_inventory_skew(buy_price, sell_price)
         quotes = {
             "buy": Quote(side="buy", price=buy_price, size=self.settings.size),
             "sell": Quote(side="sell", price=sell_price, size=self.settings.size),
@@ -291,7 +324,9 @@ class MarketMakerBot:
                 "buy_price": buy_price,
                 "sell_price": sell_price,
                 "size": self.settings.size,
-                "spread": self.settings.spread,
+                "spread": round(sell_price - buy_price, 6),
+                "spread_multiplier": spread_multiplier,
+                "net_position": round(self._net_position(), 4),
             },
         )
         return quotes
@@ -365,9 +400,21 @@ class MarketMakerBot:
                 extra={"event": "placement_paused", "token_id": self.settings.token_id, "paused_until": self.paused_until},
             )
             return
+        protection_mode = self.cycles_without_fill >= self.settings.protection_no_fill_cycles
+        max_orders_this_cycle = 1 if protection_mode else self.settings.max_orders_per_cycle
+        if protection_mode:
+            logger.warning(
+                "Protection mode reducing activity after repeated idle cycles",
+                extra={
+                    "event": "protection_reduce_activity",
+                    "token_id": self.settings.token_id,
+                    "cycles_without_fill": self.cycles_without_fill,
+                    "count": max_orders_this_cycle,
+                },
+            )
         placed_count = 0
         for side in ("buy", "sell"):
-            if placed_count >= self.settings.max_orders_per_cycle:
+            if placed_count >= max_orders_this_cycle:
                 logger.warning(
                     "Max orders per cycle reached",
                     extra={"event": "max_orders_per_cycle_reached", "token_id": self.settings.token_id, "count": placed_count},
@@ -491,6 +538,9 @@ class MarketMakerBot:
                 consecutive_api_errors=self.consecutive_api_errors,
                 last_api_error_time=self.last_api_error_time,
                 last_api_sync_time=self.last_api_sync_time,
+                cycles_without_fill=self.cycles_without_fill,
+                gross_bought=self.gross_bought,
+                gross_sold=self.gross_sold,
             )
         )
 
@@ -526,14 +576,17 @@ class MarketMakerBot:
             total_cost = (self.average_entry_price * self.position_size) + (price * size)
             self.position_size += size
             self.average_entry_price = total_cost / self.position_size if self.position_size > 0 else 0.0
+            self.gross_bought += price * size
         elif side == "sell":
             matched_size = min(self.position_size, size)
             realized_delta = (price - self.average_entry_price) * matched_size
             self.realized_pnl += realized_delta
             self.position_size = max(0.0, self.position_size - matched_size)
+            self.gross_sold += price * size
             if self.position_size <= self.settings.price_tolerance:
                 self.position_size = 0.0
                 self.average_entry_price = 0.0
+        self.cycles_without_fill = 0
         self.trades_executed += 1
         logger.info(
             "Fill processed",
@@ -547,8 +600,11 @@ class MarketMakerBot:
                 "position_size": round(self.position_size, 4),
                 "realized_pnl": round(self.realized_pnl, 4),
                 "realized_delta": round(realized_delta, 4),
+                "gross_bought": round(self.gross_bought, 4),
+                "gross_sold": round(self.gross_sold, 4),
             },
         )
+        self._log_result_snapshot("fill_result")
 
     def _record_cancellation(self) -> None:
         now = time.time()
@@ -569,3 +625,93 @@ class MarketMakerBot:
 
     def _placement_paused(self) -> bool:
         return time.time() < self.paused_until
+
+    def _calculate_liquidity_score(self, market: dict[str, Any]) -> float:
+        raw_book = market.get("raw_book") or {}
+        bids = raw_book.get("bids") or []
+        asks = raw_book.get("asks") or []
+        if not bids and not asks:
+            return self.settings.min_liquidity_score
+        return self._sum_level_sizes(bids[:3]) + self._sum_level_sizes(asks[:3])
+
+    def _sum_level_sizes(self, levels: list[Any]) -> float:
+        total = 0.0
+        for level in levels:
+            if isinstance(level, dict):
+                value = level.get("size") or level.get("quantity")
+            else:
+                value = getattr(level, "size", None)
+                if value is None:
+                    value = getattr(level, "quantity", None)
+            if value is not None:
+                total += float(value)
+        return total
+
+    def _calculate_volatility_ratio(self, midpoint: float) -> float:
+        if self.last_market_price in {None, 0}:
+            return 0.0
+        return abs(midpoint - float(self.last_market_price)) / abs(float(self.last_market_price))
+
+    def _determine_spread_multiplier(self, volatility_ratio: float) -> float:
+        multiplier = 1.0
+        if self.cycles_without_fill >= self.settings.protection_no_fill_cycles:
+            multiplier = max(multiplier, self.settings.protection_spread_multiplier)
+        if volatility_ratio >= self.settings.max_volatility_ratio * 0.5:
+            multiplier = max(multiplier, self.settings.protection_spread_multiplier)
+        return multiplier
+
+    def _apply_inventory_skew(self, buy_price: float, sell_price: float) -> tuple[float, float]:
+        soft_limit = max(self.settings.inventory_soft_limit, self.settings.price_tolerance)
+        imbalance = max(-1.0, min(1.0, self._net_position() / soft_limit))
+        adjustment = round(self.settings.inventory_price_adjustment * abs(imbalance), 4)
+        tick_size = max(float(self.settings.tick_size), self.settings.price_tolerance)
+
+        if imbalance > 0:
+            sell_price = max(round(buy_price + tick_size, 4), round(sell_price - adjustment, 4))
+        elif imbalance < 0:
+            buy_price = min(round(sell_price - tick_size, 4), round(buy_price + adjustment, 4))
+        return buy_price, sell_price
+
+    def _net_position(self) -> float:
+        return self.position_size - self.settings.inventory_target
+
+    def _estimate_round_trip_cost(self, midpoint: float) -> float:
+        return midpoint * ((2 * self.settings.fee_rate) + self.settings.estimated_slippage_rate) + self.settings.min_profit_margin
+
+    def _required_profit_spread(self, midpoint: float) -> float:
+        return self._estimate_round_trip_cost(midpoint)
+
+    def _quotes_are_profitable(self, quotes: dict[str, Quote], midpoint: float) -> bool:
+        spread = quotes["sell"].price - quotes["buy"].price
+        return spread >= self._required_profit_spread(midpoint)
+
+    def _update_protection_state(self, trades_before_cycle: int) -> None:
+        if self.trades_executed > trades_before_cycle:
+            self.cycles_without_fill = 0
+            return
+        self.cycles_without_fill += 1
+
+    def _pause_after_error_streak(self, reason: str, streak: int) -> None:
+        if streak < self.settings.protection_error_streak:
+            return
+        self.paused_until = max(self.paused_until, time.time() + self.settings.protection_pause_seconds)
+        self._log_non_operation(reason, paused_until=round(self.paused_until, 3))
+
+    def _log_non_operation(self, reason: str, **extra: Any) -> None:
+        logger.warning(
+            "Strategy decided not to operate",
+            extra={"event": "non_operable_market", "token_id": self.settings.token_id, "reason": reason, **extra},
+        )
+
+    def _log_result_snapshot(self, event: str) -> None:
+        logger.info(
+            "Result snapshot",
+            extra={
+                "event": event,
+                "token_id": self.settings.token_id,
+                "gross_bought": round(self.gross_bought, 4),
+                "gross_sold": round(self.gross_sold, 4),
+                "position_size": round(self.position_size, 4),
+                "realized_pnl": round(self.realized_pnl, 4),
+            },
+        )

@@ -18,15 +18,18 @@ Versao enxuta para producao com menos pontos de falha:
 1. Sincronizar ordens abertas com a API
 2. Validar estado local
 3. Confirmar saldo de collateral e token
-4. Validar preco e spread do book
-5. Cancelar ordens se estiverem duplicadas ou fora do alvo
-6. Criar ordens `buy` e `sell` simples, apenas com saldo confirmado
+4. Validar preco, spread, liquidez, volatilidade e lucro minimo esperado
+5. Ajustar quotes com skew simples de inventario
+6. Cancelar ordens se estiverem duplicadas ou fora do alvo
+7. Criar ordens `buy` e `sell` simples, apenas com saldo confirmado
 
 ## Garantias de seguranca
 
 - nunca cria ordem com saldo nao confirmado
 - nunca usa estado local como fonte primaria sem sync recente
 - falha fechado em saldo, sync, book invalido ou estado inconsistente
+- nao opera com spread abaixo do custo estimado, liquidez baixa ou volatilidade alta
+- reduz atividade em ciclos sem execucao e pausa em sequencias de erro
 - para o bot apos erros criticos repetidos
 - nao faz auto-hedge, auto-selecao de mercado ou logica ambigua
 
@@ -70,7 +73,8 @@ copy .env.example .env
 - Saldo e risco: `MIN_COLLATERAL_BUFFER`, `MAX_BALANCE_USAGE_PCT`, `MIN_BALANCE_THRESHOLD`
 - Validacao de mercado: `MIN_PRICE_BOUND`, `MAX_PRICE_BOUND`, `MAX_BOOK_SPREAD_PCT`, `MAX_MIDPOINT_DEVIATION_RATIO`
 - Resiliencia: `MAX_RETRIES`, `RETRY_DELAY_SECONDS`, `MAX_API_FAILURE_STREAK`, `MAX_CONSECUTIVE_ERRORS`, `MAX_SYNC_AGE_SECONDS`
-- Protecoes extras: `MIN_OPERABLE_SPREAD`, `MAX_OPERABLE_SPREAD`, `MAX_CANCELS_PER_MINUTE`, `PAUSE_AFTER_CANCEL_LIMIT_SECONDS`, `MAX_ORDER_AGE_SECONDS`, `MAX_ORDERS_PER_CYCLE`
+- Protecoes extras: `MIN_OPERABLE_SPREAD`, `MAX_OPERABLE_SPREAD`, `MIN_LIQUIDITY_SCORE`, `MAX_VOLATILITY_RATIO`, `FEE_RATE`, `ESTIMATED_SLIPPAGE_RATE`, `MIN_PROFIT_MARGIN`
+- Inventario e protecao: `INVENTORY_TARGET`, `INVENTORY_SOFT_LIMIT`, `INVENTORY_PRICE_ADJUSTMENT`, `PROTECTION_NO_FILL_CYCLES`, `PROTECTION_ERROR_STREAK`, `PROTECTION_PAUSE_SECONDS`, `PROTECTION_SPREAD_MULTIPLIER`, `MAX_CANCELS_PER_MINUTE`, `PAUSE_AFTER_CANCEL_LIMIT_SECONDS`, `MAX_ORDER_AGE_SECONDS`, `MAX_ORDERS_PER_CYCLE`
 - Operacao: `STATE_FILE`, `KILL_SWITCH_FLAG_FILE`, `LOG_LEVEL`, `LOG_FORMAT`, `DRY_RUN`
 
 ## Execucao
