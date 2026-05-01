@@ -8,6 +8,7 @@ from typing import Any, Callable
 from app.bot import MarketMakerBot
 from app.config import ConfigError, Settings, load_settings
 from app.logging_config import setup_logging
+from app.market_data import PolymarketMarketStream
 from app.polymarket import PolymarketClient
 from app.state import BotState, BotStateStore
 
@@ -40,7 +41,8 @@ class BotController:
                 return {"ok": False, "message": f"Config error: {exc}"}
 
             setup_logging(settings)
-            bot = MarketMakerBot(settings=settings, client=self._client_factory(settings))
+            market_stream = PolymarketMarketStream(settings) if settings.enable_websocket else None
+            bot = MarketMakerBot(settings=settings, client=self._client_factory(settings), market_stream=market_stream)
             thread = threading.Thread(target=self._run_bot, args=(bot,), name="market-maker-bot", daemon=True)
             self._bot = bot
             self._thread = thread

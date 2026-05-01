@@ -6,6 +6,7 @@ import signal
 from app.bot import MarketMakerBot
 from app.config import ConfigError, load_settings
 from app.logging_config import setup_logging
+from app.market_data import PolymarketMarketStream
 from app.polymarket import PolymarketApiError, PolymarketClient
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,8 @@ def main() -> None:
 
     try:
         client = PolymarketClient(settings)
-        bot = MarketMakerBot(settings=settings, client=client)
+        market_stream = PolymarketMarketStream(settings) if settings.enable_websocket else None
+        bot = MarketMakerBot(settings=settings, client=client, market_stream=market_stream)
         _install_signal_handlers(bot)
         bot.run_forever()
     except PolymarketApiError as exc:

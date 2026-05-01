@@ -11,17 +11,19 @@ Versao enxuta para producao com menos pontos de falha:
 - API sempre como source of truth
 - validacoes fail-closed
 - cancelamento e recriacao de ordens apenas quando necessario
+- modo WebSocket opcional para reagir a mudancas do order book em tempo real
 - `DRY_RUN` para teste seco sem enviar ou cancelar ordens
 
 ## Fluxo
 
-1. Sincronizar ordens abertas com a API
-2. Validar estado local
-3. Confirmar saldo de collateral e token
-4. Validar preco, spread, liquidez, volatilidade e lucro minimo esperado
-5. Ajustar quotes com skew simples de inventario
-6. Cancelar ordens se estiverem duplicadas ou fora do alvo
-7. Criar ordens `buy` e `sell` simples, apenas com saldo confirmado
+1. Receber book via WebSocket quando `ENABLE_WEBSOCKET=true`; caso contrario, consultar REST no intervalo configurado
+2. Sincronizar ordens abertas com a API
+3. Validar estado local
+4. Confirmar saldo de collateral e token
+5. Validar preco, spread, liquidez, volatilidade e lucro minimo esperado
+6. Ajustar quotes com skew simples de inventario
+7. Cancelar ordens se estiverem duplicadas ou fora do alvo
+8. Criar ordens `buy` e `sell` simples, apenas com saldo confirmado
 
 ## Garantias de seguranca
 
@@ -37,6 +39,7 @@ Versao enxuta para producao com menos pontos de falha:
 
 - `app/config.py`: configuracao via `.env`
 - `app/polymarket.py`: wrapper simples do cliente CLOB
+- `app/market_data.py`: stream WebSocket do book e cache local de snapshot
 - `app/bot.py`: fluxo principal do market maker
 - `app/state.py`: persistencia minima do estado
 - `app/logging_config.py`: logging em `text` ou `json`
@@ -75,6 +78,7 @@ copy .env.example .env
 ## Variaveis principais
 
 - Estrategia: `SPREAD`, `SIZE`, `LOOP_INTERVAL_SECONDS`, `PRICE_TOLERANCE`
+- Tempo real: `ENABLE_WEBSOCKET`, `WS_MARKET_URL`, `WS_RECONNECT_SECONDS`, `EVENT_DEBOUNCE_SECONDS`, `EVENT_IDLE_POLL_SECONDS`
 - Saldo e risco: `MIN_COLLATERAL_BUFFER`, `MAX_BALANCE_USAGE_PCT`, `MIN_BALANCE_THRESHOLD`
 - Validacao de mercado: `MIN_PRICE_BOUND`, `MAX_PRICE_BOUND`, `MAX_BOOK_SPREAD_PCT`, `MAX_MIDPOINT_DEVIATION_RATIO`
 - Resiliencia: `MAX_RETRIES`, `RETRY_DELAY_SECONDS`, `MAX_API_FAILURE_STREAK`, `MAX_CONSECUTIVE_ERRORS`, `MAX_SYNC_AGE_SECONDS`
@@ -130,3 +134,7 @@ Se o arquivo configurado em `KILL_SWITCH_FLAG_FILE` existir, o bot encerra o loo
 ## Dry run
 
 Com `DRY_RUN=true`, o bot continua lendo book, saldo e ordens, mas nao envia novas ordens nem cancela ordens existentes.
+
+## WebSocket
+
+Com `ENABLE_WEBSOCKET=true`, o bot assina o canal publico de mercado da Polymarket, mantem um snapshot local do book e roda um ciclo quando chegam atualizacoes. Se o snapshot ainda nao existir ou ficar velho, ele volta para o book via REST. `EVENT_DEBOUNCE_SECONDS` evita cancel/replace excessivo em rajadas de eventos.

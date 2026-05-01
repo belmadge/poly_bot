@@ -52,6 +52,11 @@ class Settings:
     protection_error_streak: int
     protection_pause_seconds: float
     protection_spread_multiplier: float
+    enable_websocket: bool
+    ws_market_url: str
+    ws_reconnect_seconds: float
+    event_debounce_seconds: float
+    event_idle_poll_seconds: float
     dry_run: bool
     api_key: str | None = None
     api_secret: str | None = None
@@ -125,6 +130,11 @@ def load_settings() -> Settings:
             protection_error_streak=int(os.getenv("PROTECTION_ERROR_STREAK", "2")),
             protection_pause_seconds=float(os.getenv("PROTECTION_PAUSE_SECONDS", "180.0")),
             protection_spread_multiplier=float(os.getenv("PROTECTION_SPREAD_MULTIPLIER", "1.5")),
+            enable_websocket=_parse_bool("ENABLE_WEBSOCKET", False),
+            ws_market_url=os.getenv("WS_MARKET_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
+            ws_reconnect_seconds=float(os.getenv("WS_RECONNECT_SECONDS", "5.0")),
+            event_debounce_seconds=float(os.getenv("EVENT_DEBOUNCE_SECONDS", "0.25")),
+            event_idle_poll_seconds=float(os.getenv("EVENT_IDLE_POLL_SECONDS", "30.0")),
             dry_run=_parse_bool("DRY_RUN", False),
             api_key=os.getenv("CLOB_API_KEY"),
             api_secret=os.getenv("CLOB_SECRET"),

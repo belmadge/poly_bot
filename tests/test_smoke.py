@@ -79,6 +79,11 @@ def settings(temp_state_file, kill_switch_path):
         protection_error_streak=2,
         protection_pause_seconds=180.0,
         protection_spread_multiplier=1.5,
+        enable_websocket=False,
+        ws_market_url="wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        ws_reconnect_seconds=5.0,
+        event_debounce_seconds=0.0,
+        event_idle_poll_seconds=30.0,
         dry_run=False,
     )
 

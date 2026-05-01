@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings
+from app.market_data import PolymarketMarketStream
 from app.polymarket import PolymarketApiError, PolymarketClient
 from app.state import BotState, BotStateStore
 
@@ -22,9 +23,10 @@ class Quote:
 
 
 class MarketMakerBot:
-    def __init__(self, settings: Settings, client: PolymarketClient) -> None:
+    def __init__(self, settings: Settings, client: PolymarketClient, market_stream: PolymarketMarketStream | None = None) -> None:
         self.settings = settings
         self.client = client
+        self.market_stream = market_stream
         self.state_store = BotStateStore(settings.state_file)
         state = self.state_store.load()
         self.known_orders: dict[str, dict[str, Any]] = state.known_orders
@@ -56,57 +58,72 @@ class MarketMakerBot:
             "Starting market maker bot",
             extra={"event": "startup", "token_id": self.settings.token_id, "interval_seconds": self.settings.loop_interval_seconds},
         )
-        while not self.shutdown_event.is_set():
-            if self._check_kill_switch():
-                logger.critical("Kill switch activated", extra={"event": "kill_switch"})
-                self.shutdown_event.set()
-                break
+        if self.market_stream is not None:
+            self.market_stream.start()
+        try:
+            while not self.shutdown_event.is_set():
+                if self._check_kill_switch():
+                    logger.critical("Kill switch activated", extra={"event": "kill_switch"})
+                    self.shutdown_event.set()
+                    break
 
-            try:
-                self.run_once()
-                self.consecutive_api_errors = 0
-                self.consecutive_execution_errors = 0
-                self.last_api_error_time = 0.0
-            except KeyboardInterrupt:
-                logger.info("Bot interrupted by user", extra={"event": "shutdown"})
-                self.shutdown_event.set()
-                break
-            except PolymarketApiError as exc:
-                self.consecutive_api_errors += 1
-                self.last_api_error_time = time.time()
-                self._pause_after_error_streak("api_errors", self.consecutive_api_errors)
-                logger.exception(
-                    "Critical API error in main loop",
-                    extra={
-                        "event": "api_error",
-                        "error": str(exc),
-                        "consecutive_errors": self.consecutive_api_errors,
-                        "limit": self.settings.max_api_failure_streak,
-                    },
-                )
-                if self.consecutive_api_errors >= self.settings.max_api_failure_streak:
-                    logger.critical("Stopping bot after repeated API failures", extra={"event": "api_failure_stop"})
+                try:
+                    self.run_once()
+                    self.consecutive_api_errors = 0
+                    self.consecutive_execution_errors = 0
+                    self.last_api_error_time = 0.0
+                except KeyboardInterrupt:
+                    logger.info("Bot interrupted by user", extra={"event": "shutdown"})
                     self.shutdown_event.set()
-            except Exception as exc:  # noqa: BLE001
-                self.consecutive_execution_errors += 1
-                self._pause_after_error_streak("execution_errors", self.consecutive_execution_errors)
-                logger.exception(
-                    "Unexpected execution error",
-                    extra={
-                        "event": "unexpected_error",
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
-                        "consecutive_errors": self.consecutive_execution_errors,
-                        "limit": self.settings.max_consecutive_errors,
-                    },
-                )
-                if self.consecutive_execution_errors >= self.settings.max_consecutive_errors:
-                    logger.critical("Stopping bot after repeated execution failures", extra={"event": "execution_failure_stop"})
-                    self.shutdown_event.set()
-            finally:
-                self._save_state()
-                if not self.shutdown_event.is_set():
-                    time.sleep(self.settings.loop_interval_seconds)
+                    break
+                except PolymarketApiError as exc:
+                    self.consecutive_api_errors += 1
+                    self.last_api_error_time = time.time()
+                    self._pause_after_error_streak("api_errors", self.consecutive_api_errors)
+                    logger.exception(
+                        "Critical API error in main loop",
+                        extra={
+                            "event": "api_error",
+                            "error": str(exc),
+                            "consecutive_errors": self.consecutive_api_errors,
+                            "limit": self.settings.max_api_failure_streak,
+                        },
+                    )
+                    if self.consecutive_api_errors >= self.settings.max_api_failure_streak:
+                        logger.critical("Stopping bot after repeated API failures", extra={"event": "api_failure_stop"})
+                        self.shutdown_event.set()
+                except Exception as exc:  # noqa: BLE001
+                    self.consecutive_execution_errors += 1
+                    self._pause_after_error_streak("execution_errors", self.consecutive_execution_errors)
+                    logger.exception(
+                        "Unexpected execution error",
+                        extra={
+                            "event": "unexpected_error",
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "consecutive_errors": self.consecutive_execution_errors,
+                            "limit": self.settings.max_consecutive_errors,
+                        },
+                    )
+                    if self.consecutive_execution_errors >= self.settings.max_consecutive_errors:
+                        logger.critical("Stopping bot after repeated execution failures", extra={"event": "execution_failure_stop"})
+                        self.shutdown_event.set()
+                finally:
+                    self._save_state()
+                    self._wait_for_next_cycle()
+        finally:
+            if self.market_stream is not None:
+                self.market_stream.stop()
+
+    def _wait_for_next_cycle(self) -> None:
+        if self.shutdown_event.is_set():
+            return
+        if self.market_stream is None:
+            time.sleep(self.settings.loop_interval_seconds)
+            return
+        self.market_stream.wait_for_update(self.settings.event_idle_poll_seconds)
+        if self.settings.event_debounce_seconds > 0:
+            time.sleep(self.settings.event_debounce_seconds)
 
     def run_once(self) -> None:
         trades_before_cycle = self.trades_executed
@@ -259,7 +276,7 @@ class MarketMakerBot:
         return float(collateral), float(token_balance)
 
     def _get_valid_market_snapshot(self) -> dict[str, Any]:
-        market = self._with_retry(lambda: self.client.get_market_snapshot(self.settings.token_id))
+        market = self._get_market_snapshot()
         midpoint = float(market["midpoint"])
         spread = float(market["book_spread"])
         liquidity_score = self._calculate_liquidity_score(market)
@@ -314,6 +331,15 @@ class MarketMakerBot:
         market["volatility_ratio"] = volatility_ratio
         market["spread_multiplier"] = spread_multiplier
         return market
+
+    def _get_market_snapshot(self) -> dict[str, Any]:
+        if self.market_stream is not None:
+            snapshot = self.market_stream.latest_snapshot(self.settings.max_sync_age_seconds)
+            if snapshot is not None:
+                logger.debug("Using websocket market snapshot", extra={"event": "ws_snapshot_used", "token_id": self.settings.token_id})
+                return snapshot
+            logger.warning("Websocket snapshot unavailable or stale, using REST book", extra={"event": "ws_snapshot_fallback", "token_id": self.settings.token_id})
+        return self._with_retry(lambda: self.client.get_market_snapshot(self.settings.token_id))
 
     def _build_quotes(self, midpoint: float, spread_multiplier: float = 1.0) -> dict[str, Quote]:
         half_spread = (self.settings.spread * spread_multiplier) / 2.0
